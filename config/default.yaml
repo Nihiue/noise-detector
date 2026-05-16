@@ -1,0 +1,59 @@
+app:
+  host: 0.0.0.0
+  port: 8000
+
+audio:
+  device_name: null
+  sample_rate: 44100
+  chunk_size: 1024
+  format: int16
+
+detection:
+  window_seconds: 3.0
+  capture_seconds: 15.0
+
+storage:
+  records_dir: data/records
+  database_path: data/audio-detect.db
+
+classification:
+  enabled: true
+  label: Unknown
+  score_threshold: 0.2
+  model_path: data/models/yamnet.tflite
+  class_map_path: data/models/yamnet_class_map.csv
+  retained_labels:
+    - Engine
+    - Engine starting
+    - Engine knocking
+    - Light engine (high frequency)
+    - Medium engine (mid frequency)
+    - Heavy engine (low frequency)
+    - Motorcycle
+    - Motor vehicle (road)
+    - Vehicle
+    - Car
+    - Car passing by
+    - Vehicle horn, car horn, honking
+    - Truck
+    - Bus
+    - Traffic noise, roadway noise
+    - Zipper (clothing)
+    - Radio
+    - Aircraft
+    - Jet engine
+    - Aircraft engine
+    - Helicopter
+    - Chainsaw
+    - "Dental drill, dentist's drill"
+    - "Accelerating, revving, vroom"
+    - Alarm
+    - "Gunshot, gunfire"
+
+retention:
+  max_record_days: 30
+  max_records: 2000
+
+logging:
+  level: INFO
+  file_path: data/logs/audio-detect.log

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv/
+data/records/
+data/noise_events.jsonl
+data/samples/
+data/*.db
+data/logs/

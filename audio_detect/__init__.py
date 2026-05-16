@@ -1,0 +1,1 @@
+"""Audio detection service package."""
