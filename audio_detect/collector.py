@@ -61,9 +61,9 @@ class _NoiseFloorGate:
     # This prevents persistent foreground noise from training the baseline.
     _BACKGROUND_MARGIN_DB = 4.0
     # Classify only when a window is meaningfully above the learned floor.
-    _TRIGGER_MARGIN_DB = 9.0
+    _TRIGGER_MARGIN_DB = 4.0
     # A fixed absolute floor avoids drift in extremely quiet environments.
-    _ABSOLUTE_MIN_DBFS = -42.0
+    _ABSOLUTE_MIN_DBFS = -60.0
     # Require enough history before trusting the adaptive floor.
     _MIN_WARMUP_WINDOWS = 10
     _SILENCE_FLOOR_DBFS = -90.0
