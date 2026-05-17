@@ -142,8 +142,8 @@ class Classifier:
         if not model_path.exists():
             return None
         try:
-            import tensorflow as tf
+            import tflite_runtime.interpreter as tflite
 
-            return tf.lite.Interpreter(model_path=str(model_path))
+            return tflite.Interpreter(model_path=str(model_path))
         except Exception:
             return None
