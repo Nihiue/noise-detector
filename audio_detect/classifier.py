@@ -4,6 +4,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+import ai_edge_litert.interpreter as tflite
 
 import numpy as np
 
@@ -142,8 +143,7 @@ class Classifier:
         if not model_path.exists():
             return None
         try:
-            import tflite_runtime.interpreter as tflite
-
             return tflite.Interpreter(model_path=str(model_path))
-        except Exception:
+        except Exception as e:
+            print("Failed to load interpreter: {msg}".format(msg=e))
             return None

@@ -33,9 +33,13 @@ class CollectorRuntimeStatus:
     last_peak_dbfs: float = -90.0
     detection_window_seconds: float = 0.0
     capture_seconds: float = 0.0
+    noise_floor_rms: float = 0.0
+    noise_floor_std_rms: float = 0.0
+    trigger_threshold_rms: float = 0.0
     noise_floor_dbfs: float = -90.0
     trigger_threshold_dbfs: float = -90.0
     gate_ready: bool = False
+    is_calibrating: bool = False
     last_gate_open: bool = False
     recent_detection_windows: list[dict[str, object]] = field(default_factory=list)
     last_error: str = ""
@@ -44,84 +48,107 @@ class CollectorRuntimeStatus:
 @dataclass(frozen=True)
 class _NoiseGateDecision:
     should_classify: bool
+    current_rms: float
     current_dbfs: float
+    noise_floor_rms: float
+    noise_floor_std_rms: float
+    trigger_threshold_rms: float
     noise_floor_dbfs: float
     trigger_threshold_dbfs: float
     is_ready: bool
 
 
 class _NoiseFloorGate:
-    # A long horizon keeps short bursts from moving the baseline.
-    _BASELINE_WINDOW_SECONDS = 180.0
-    # We estimate the floor from the quiet tail of recent windows instead of
-    # using the mean/median, because sustained traffic or wind can otherwise
-    # drag the baseline upward until the gate becomes useless.
-    _BASELINE_QUANTILE = 0.2
-    # Ignore windows far above the current floor when learning background.
-    # This prevents persistent foreground noise from training the baseline.
-    _BACKGROUND_MARGIN_DB = 4.0
-    # Classify only when a window is meaningfully above the learned floor.
-    _TRIGGER_MARGIN_DB = 4.0
-    # A fixed absolute floor avoids drift in extremely quiet environments.
-    _ABSOLUTE_MIN_DBFS = -60.0
-    # Require enough history before trusting the adaptive floor.
-    _MIN_WARMUP_WINDOWS = 10
     _SILENCE_FLOOR_DBFS = -90.0
+    _CALIBRATION_BUCKETS = 20
 
-    def __init__(self, detection_window_seconds: float) -> None:
-        history_size = max(
-            self._MIN_WARMUP_WINDOWS,
-            math.ceil(self._BASELINE_WINDOW_SECONDS / max(detection_window_seconds, 0.1)),
-        )
-        self._history: deque[float] = deque(maxlen=history_size)
+    def __init__(
+        self,
+        detection_window_seconds: float,
+        threshold_stddev_multiplier: float = 1.0,
+    ) -> None:
+        self.threshold_stddev_multiplier = threshold_stddev_multiplier
+        self._noise_floor_rms: Optional[float] = None
+        self._noise_floor_std_rms: float = 0.0
+        self._trigger_threshold_rms: Optional[float] = None
 
     def evaluate(self, rms: float) -> _NoiseGateDecision:
         current_dbfs = self._rms_to_dbfs(rms)
-        noise_floor_dbfs = self._estimate_noise_floor()
-        trigger_threshold_dbfs = max(
-            noise_floor_dbfs + self._TRIGGER_MARGIN_DB,
-            self._ABSOLUTE_MIN_DBFS,
-        )
-        is_ready = len(self._history) >= self._MIN_WARMUP_WINDOWS
-        should_classify = is_ready and current_dbfs >= trigger_threshold_dbfs
-
-        self._maybe_update_history(
-            current_dbfs=current_dbfs,
-            noise_floor_dbfs=noise_floor_dbfs,
-            is_ready=is_ready,
-        )
-        updated_noise_floor_dbfs = self._estimate_noise_floor()
-        updated_trigger_threshold_dbfs = max(
-            updated_noise_floor_dbfs + self._TRIGGER_MARGIN_DB,
-            self._ABSOLUTE_MIN_DBFS,
-        )
+        is_ready = self.is_ready
 
         return _NoiseGateDecision(
-            should_classify=should_classify,
+            should_classify=is_ready and rms > self.trigger_threshold_rms,
+            current_rms=rms,
             current_dbfs=current_dbfs,
-            noise_floor_dbfs=updated_noise_floor_dbfs,
-            trigger_threshold_dbfs=updated_trigger_threshold_dbfs,
+            noise_floor_rms=self.noise_floor_rms,
+            noise_floor_std_rms=self.noise_floor_std_rms,
+            trigger_threshold_rms=self.trigger_threshold_rms,
+            noise_floor_dbfs=self.noise_floor_dbfs,
+            trigger_threshold_dbfs=self.trigger_threshold_dbfs,
             is_ready=is_ready,
         )
 
-    def _maybe_update_history(
-        self,
-        *,
-        current_dbfs: float,
-        noise_floor_dbfs: float,
-        is_ready: bool,
-    ) -> None:
-        if not is_ready:
-            self._history.append(current_dbfs)
-            return
+    def calibrate(self, samples: np.ndarray) -> _NoiseGateDecision:
+        rms_values = self._bucket_rms(samples)
+        self._noise_floor_rms = float(np.mean(rms_values))
+        self._noise_floor_std_rms = float(np.std(rms_values))
+        self._trigger_threshold_rms = (
+            self._noise_floor_rms
+            + self._noise_floor_std_rms * self.threshold_stddev_multiplier
+        )
+        current_rms = float(self._compute_rms(samples))
 
-        if current_dbfs <= noise_floor_dbfs + self._BACKGROUND_MARGIN_DB:
-            self._history.append(current_dbfs)
+        return _NoiseGateDecision(
+            should_classify=False,
+            current_rms=current_rms,
+            current_dbfs=self._rms_to_dbfs(current_rms),
+            noise_floor_rms=self.noise_floor_rms,
+            noise_floor_std_rms=self.noise_floor_std_rms,
+            trigger_threshold_rms=self.trigger_threshold_rms,
+            noise_floor_dbfs=self.noise_floor_dbfs,
+            trigger_threshold_dbfs=self.trigger_threshold_dbfs,
+            is_ready=True,
+        )
 
-    def _estimate_noise_floor(self) -> float:
-        if not self._history:
-            return self._SILENCE_FLOOR_DBFS
-        return float(np.quantile(np.asarray(self._history, dtype=np.float32), self._BASELINE_QUANTILE))
+    @property
+    def is_ready(self) -> bool:
+        return self._noise_floor_rms is not None and self._trigger_threshold_rms is not None
+
+    @property
+    def noise_floor_rms(self) -> float:
+        return self._noise_floor_rms or 0.0
+
+    @property
+    def noise_floor_std_rms(self) -> float:
+        return self._noise_floor_std_rms
+
+    @property
+    def trigger_threshold_rms(self) -> float:
+        return self._trigger_threshold_rms or 0.0
+
+    @property
+    def noise_floor_dbfs(self) -> float:
+        return self._rms_to_dbfs(self.noise_floor_rms)
+
+    @property
+    def trigger_threshold_dbfs(self) -> float:
+        return self._rms_to_dbfs(self.trigger_threshold_rms)
+
+    @classmethod
+    def _bucket_rms(cls, samples: np.ndarray) -> np.ndarray:
+        if samples.size == 0:
+            return np.asarray([0.0], dtype=np.float32)
+        bucket_count = min(cls._CALIBRATION_BUCKETS, samples.size)
+        buckets = np.array_split(samples, bucket_count)
+        return np.asarray(
+            [cls._compute_rms(bucket) for bucket in buckets if bucket.size > 0],
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _compute_rms(samples: np.ndarray) -> float:
+        normalized = samples.astype(np.float32)
+        return float(np.sqrt(np.mean(normalized * normalized)))
 
     @classmethod
     def _rms_to_dbfs(cls, rms: float) -> float:
@@ -234,7 +261,10 @@ class CollectorService:
         self._audio_input_factory = None if audio_input is not None else lambda: AudioInput(audio_config)
         self.audio_input = audio_input or self._create_audio_input()
         self.logger = logging.getLogger("audio_detect.collector")
-        self._noise_gate = _NoiseFloorGate(detection_config.window_seconds)
+        self._noise_gate = _NoiseFloorGate(
+            detection_config.window_seconds,
+            threshold_stddev_multiplier=detection_config.threshold_stddev_multiplier,
+        )
         self._recent_detection_windows: deque[dict[str, object]] = deque(maxlen=10)
         self._status_lock = threading.Lock()
         self.status = CollectorRuntimeStatus(
@@ -251,16 +281,17 @@ class CollectorService:
             is_running=False,
             detection_window_seconds=self.detection_config.window_seconds,
             capture_seconds=self.detection_config.capture_seconds,
+            noise_floor_rms=0.0,
+            noise_floor_std_rms=0.0,
+            trigger_threshold_rms=0.0,
             noise_floor_dbfs=_NoiseFloorGate._SILENCE_FLOOR_DBFS,
-            trigger_threshold_dbfs=max(
-                _NoiseFloorGate._SILENCE_FLOOR_DBFS + _NoiseFloorGate._TRIGGER_MARGIN_DB,
-                _NoiseFloorGate._ABSOLUTE_MIN_DBFS,
-            ),
+            trigger_threshold_dbfs=_NoiseFloorGate._SILENCE_FLOOR_DBFS,
             last_error=self.audio_input.last_error,
         )
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._recovery_wait_seconds = 1.0
+        self._calibration_requested = threading.Event()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -279,6 +310,11 @@ class CollectorService:
         self.audio_input.close()
         if self._thread:
             self._thread.join(timeout=2.0)
+
+    def request_calibration(self) -> CollectorRuntimeStatus:
+        self._calibration_requested.set()
+        self._update_status(is_calibrating=True)
+        return self.get_status()
 
     def _run(self) -> None:
         self._update_status(
@@ -334,25 +370,65 @@ class CollectorService:
             detection_frames = self._collect_chunk_batch(detection_chunks)
             detection_audio = np.concatenate(detection_frames).astype(np.int16)
             rms = self._compute_rms(detection_audio)
+            if self._calibration_requested.is_set() or not self._noise_gate.is_ready:
+                self._calibration_requested.clear()
+                gate_decision = self._noise_gate.calibrate(detection_audio)
+                self._remember_detection_window(detection_audio, rms, gate_decision)
+                self._mark_latest_detection_window("calibrated")
+                self._update_status(
+                    last_peak_rms=round(rms, 2),
+                    last_peak_dbfs=round(gate_decision.current_dbfs, 2),
+                    noise_floor_rms=round(gate_decision.noise_floor_rms, 2),
+                    noise_floor_std_rms=round(gate_decision.noise_floor_std_rms, 2),
+                    trigger_threshold_rms=round(gate_decision.trigger_threshold_rms, 2),
+                    noise_floor_dbfs=round(gate_decision.noise_floor_dbfs, 2),
+                    trigger_threshold_dbfs=round(gate_decision.trigger_threshold_dbfs, 2),
+                    gate_ready=gate_decision.is_ready,
+                    is_calibrating=False,
+                    last_gate_open=False,
+                    recent_detection_windows=self._get_detection_window_previews(),
+                    last_error=self.audio_input.last_error,
+                )
+                self.logger.info(
+                    "noise floor calibrated noise_floor_rms=%s noise_floor_std_rms=%s trigger_threshold_rms=%s",
+                    round(gate_decision.noise_floor_rms, 2),
+                    round(gate_decision.noise_floor_std_rms, 2),
+                    round(gate_decision.trigger_threshold_rms, 2),
+                )
+                self.logger.debug(
+                    "noise floor calibrated dbfs=%s window_rms=%s",
+                    round(gate_decision.noise_floor_dbfs, 2),
+                    round(rms, 2),
+                )
+                continue
+
             gate_decision = self._noise_gate.evaluate(rms)
             self._remember_detection_window(detection_audio, rms, gate_decision)
             self._update_status(
                 last_peak_rms=round(rms, 2),
                 last_peak_dbfs=round(gate_decision.current_dbfs, 2),
+                noise_floor_rms=round(gate_decision.noise_floor_rms, 2),
+                noise_floor_std_rms=round(gate_decision.noise_floor_std_rms, 2),
+                trigger_threshold_rms=round(gate_decision.trigger_threshold_rms, 2),
                 noise_floor_dbfs=round(gate_decision.noise_floor_dbfs, 2),
                 trigger_threshold_dbfs=round(gate_decision.trigger_threshold_dbfs, 2),
                 gate_ready=gate_decision.is_ready,
+                is_calibrating=False,
                 last_gate_open=gate_decision.should_classify,
                 recent_detection_windows=self._get_detection_window_previews(),
                 last_error=self.audio_input.last_error,
             )
             if not gate_decision.should_classify:
                 self.logger.debug(
-                    "detection window skipped by gate current_dbfs=%s noise_floor_dbfs=%s trigger_threshold_dbfs=%s gate_ready=%s",
-                    round(gate_decision.current_dbfs, 2),
-                    round(gate_decision.noise_floor_dbfs, 2),
-                    round(gate_decision.trigger_threshold_dbfs, 2),
+                    "detection window skipped by gate current_rms=%s trigger_threshold_rms=%s gate_ready=%s",
+                    round(gate_decision.current_rms, 2),
+                    round(gate_decision.trigger_threshold_rms, 2),
                     gate_decision.is_ready,
+                )
+                self.logger.debug(
+                    "detection window skipped by gate current_dbfs=%s trigger_threshold_dbfs=%s",
+                    round(gate_decision.current_dbfs, 2),
+                    round(gate_decision.trigger_threshold_dbfs, 2),
                 )
                 continue
             classification = self.classifier.classify_samples(
@@ -370,13 +446,42 @@ class CollectorService:
                     round(classification.score, 4),
                 )
                 continue
-            capture_frames = self._collect_chunk_batch(capture_chunks)
+            self._mark_latest_detection_window("recorded")
+            self._update_status(
+                recent_detection_windows=self._get_detection_window_previews(),
+            )
+            capture_frames = []
+            remaining_capture_chunks = capture_chunks
+            while remaining_capture_chunks > 0 and not self._stop_event.is_set():
+                batch_chunks = min(detection_chunks, remaining_capture_chunks)
+                capture_batch = self._collect_chunk_batch(batch_chunks)
+                capture_frames.extend(capture_batch)
+                remaining_capture_chunks -= len(capture_batch)
+                capture_audio = np.concatenate(capture_batch).astype(np.int16)
+                capture_rms = self._compute_rms(capture_audio)
+                capture_gate_decision = self._noise_gate.evaluate(capture_rms)
+                self._remember_detection_window(
+                    capture_audio,
+                    capture_rms,
+                    capture_gate_decision,
+                )
+                self._mark_latest_detection_window("recorded")
+                self._update_status(
+                    last_peak_rms=round(capture_rms, 2),
+                    last_peak_dbfs=round(capture_gate_decision.current_dbfs, 2),
+                    noise_floor_rms=round(capture_gate_decision.noise_floor_rms, 2),
+                    noise_floor_std_rms=round(capture_gate_decision.noise_floor_std_rms, 2),
+                    trigger_threshold_rms=round(capture_gate_decision.trigger_threshold_rms, 2),
+                    noise_floor_dbfs=round(capture_gate_decision.noise_floor_dbfs, 2),
+                    trigger_threshold_dbfs=round(capture_gate_decision.trigger_threshold_dbfs, 2),
+                    gate_ready=capture_gate_decision.is_ready,
+                    is_calibrating=False,
+                    last_gate_open=True,
+                    recent_detection_windows=self._get_detection_window_previews(),
+                    last_error=self.audio_input.last_error,
+                )
             recording_frames = [*detection_frames, *capture_frames]
             recording_audio = np.concatenate(recording_frames).astype(np.int16)
-            final_classification = self.classifier.classify_samples(
-                recording_audio.astype(np.float32) / 32768.0,
-                self.audio_config.sample_rate,
-            )
             peak_rms = self._compute_rms(recording_audio)
             recording_path = self._write_recording(recording_frames)
             event_time = datetime.now(timezone.utc).isoformat()
@@ -386,21 +491,16 @@ class CollectorService:
                     filename=recording_path.name,
                     peak_rms=round(peak_rms, 2),
                     duration_seconds=self._compute_duration_seconds(recording_audio),
-                    classification=final_classification.label,
-                    classification_score=round(final_classification.score, 4),
-                    top_classes=final_classification.top_classes,
+                    classification=classification.label,
+                    classification_score=round(classification.score, 4),
+                    top_classes=classification.top_classes,
                 )
             )
-            self._mark_latest_detection_window("recorded")
-            self._update_status(
-                recent_detection_windows=self._get_detection_window_previews(),
-            )
             self.logger.info(
-                "event captured file=%s trigger_class=%s final_class=%s final_score=%s peak_rms=%s",
+                "event captured file=%s class=%s score=%s peak_rms=%s",
                 recording_path.name,
                 classification.label,
-                final_classification.label,
-                round(final_classification.score, 4),
+                round(classification.score, 4),
                 round(peak_rms, 2),
             )
 
@@ -472,9 +572,14 @@ class CollectorService:
     ) -> None:
         self._recent_detection_windows.append(
             {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "window_duration_seconds": self.detection_config.window_seconds,
                 "points": self._build_waveform_preview(samples),
                 "rms": round(rms, 2),
                 "dbfs": round(gate_decision.current_dbfs, 2),
+                "noise_floor_rms": round(gate_decision.noise_floor_rms, 2),
+                "noise_floor_std_rms": round(gate_decision.noise_floor_std_rms, 2),
+                "trigger_threshold_rms": round(gate_decision.trigger_threshold_rms, 2),
                 "noise_floor_dbfs": round(gate_decision.noise_floor_dbfs, 2),
                 "trigger_threshold_dbfs": round(gate_decision.trigger_threshold_dbfs, 2),
                 "gate_open": gate_decision.should_classify,
@@ -521,9 +626,13 @@ class CollectorService:
                 last_peak_dbfs=self.status.last_peak_dbfs,
                 detection_window_seconds=self.status.detection_window_seconds,
                 capture_seconds=self.status.capture_seconds,
+                noise_floor_rms=self.status.noise_floor_rms,
+                noise_floor_std_rms=self.status.noise_floor_std_rms,
+                trigger_threshold_rms=self.status.trigger_threshold_rms,
                 noise_floor_dbfs=self.status.noise_floor_dbfs,
                 trigger_threshold_dbfs=self.status.trigger_threshold_dbfs,
                 gate_ready=self.status.gate_ready,
+                is_calibrating=self.status.is_calibrating,
                 last_gate_open=self.status.last_gate_open,
                 recent_detection_windows=[dict(item) for item in self.status.recent_detection_windows],
                 last_error=self.status.last_error,

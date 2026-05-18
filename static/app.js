@@ -1,7 +1,14 @@
 (() => {
-  const {createElement: h, useEffect, useState} = React;
+  const {createElement: h, useEffect, useRef, useState} = React;
   const root = ReactDOM.createRoot(document.getElementById("root"));
   dayjs.extend(dayjs_plugin_utc);
+  const WINDOW_LIMIT = 10;
+  const OUTCOME_COLORS = {
+    ignored: "rgba(31, 26, 20, 0.38)",
+    calibrated: "#2f7f68",
+    detected: "#2f5f9f",
+    recorded: "#9f4f2a",
+  };
 
   const defaultStatus = {
     selected_device_index: null,
@@ -11,9 +18,13 @@
     last_peak_dbfs: -90,
     detection_window_seconds: 0,
     capture_seconds: 0,
+    noise_floor_rms: 0,
+    noise_floor_std_rms: 0,
+    trigger_threshold_rms: 0,
     noise_floor_dbfs: -90,
     trigger_threshold_dbfs: -90,
     gate_ready: false,
+    is_calibrating: false,
     last_gate_open: false,
     recent_detection_windows: [],
     last_error: "",
@@ -29,8 +40,11 @@
     return params.toString();
   }
 
-  async function fetchJson(url) {
-    const response = await fetch(url, {headers: {"Accept": "application/json"}});
+  async function fetchJson(url, options = {}) {
+    const response = await fetch(url, {
+      ...options,
+      headers: {"Accept": "application/json", ...(options.headers || {})},
+    });
     const payload = await response.json();
     if (!response.ok) {
       throw new Error(payload.error || "请求失败");
@@ -43,20 +57,38 @@
     return parsed.isValid() ? parsed.local().format("YYYY-MM-DD HH:mm:ss") : value;
   }
 
-  function dbfsToY(dbfs) {
-    const clamped = Math.max(-90, Math.min(0, Number(dbfs)));
-    return 72 - ((clamped + 90) / 90) * 72;
-  }
-
   function windowOutcomeLabel(item) {
     const outcome = item.outcome || (item.gate_open ? "detected" : "ignored");
     if (outcome === "recorded") {
       return "已记录";
     }
+    if (outcome === "calibrated") {
+      return "已校准";
+    }
     if (outcome === "detected") {
       return "已检测";
     }
     return "已忽略";
+  }
+
+  function windowOutcome(item) {
+    return item.outcome || (item.gate_open ? "detected" : "ignored");
+  }
+
+  function windowSignature(item) {
+    return JSON.stringify({
+      timestamp: item.timestamp,
+      points: item.points || [],
+      rms: item.rms,
+      dbfs: item.dbfs,
+      trigger_threshold_rms: item.trigger_threshold_rms,
+      noise_floor_rms: item.noise_floor_rms,
+    });
+  }
+
+  function timestampToMs(value) {
+    const parsed = Date.parse(value || "");
+    return Number.isFinite(parsed) ? parsed : Date.now();
   }
 
   function StatusCard({label, value}) {
@@ -79,8 +111,9 @@
         value: `${status.detection_window_seconds}s / ${status.capture_seconds}s`,
       }),
       h(StatusCard, {key: "rms", label: "最近峰值 RMS", value: status.last_peak_rms}),
-      h(StatusCard, {key: "threshold", label: "当前门限", value: `${status.trigger_threshold_dbfs} dBFS`}),
-      h(StatusCard, {key: "floor", label: "估计底噪", value: `${status.noise_floor_dbfs} dBFS`}),
+      h(StatusCard, {key: "threshold", label: "分类阈值", value: `${status.trigger_threshold_rms} RMS / ${status.trigger_threshold_dbfs} dBFS`}),
+      h(StatusCard, {key: "floor", label: "底噪均值", value: `${status.noise_floor_rms} RMS / ${status.noise_floor_dbfs} dBFS`}),
+      h(StatusCard, {key: "std", label: "底噪标准差", value: status.noise_floor_std_rms}),
       h(StatusCard, {
         key: "gate",
         label: "最近窗口",
@@ -89,62 +122,279 @@
     ]);
   }
 
-  function WaveformCard({item, index}) {
-    const points = item.points || [];
-    const polyline = points.map((value, pointIndex) => {
-      const x = points.length === 1 ? 50 : (pointIndex / (points.length - 1)) * 100;
-      const y = 36 - Math.max(-1, Math.min(1, Number(value))) * 34;
-      return `${x.toFixed(2)},${y.toFixed(2)}`;
-    }).join(" ");
-    const thresholdY = dbfsToY(item.trigger_threshold_dbfs).toFixed(2);
-    const outcome = item.outcome || (item.gate_open ? "detected" : "ignored");
-
-    return h("div", {className: `waveform-card ${outcome !== "ignored" ? "gate-open" : ""}`}, [
-      h("div", {key: "top", className: "waveform-meta"}, [
-        h("span", {key: "index"}, `#${index}`),
-        h("span", {key: "dbfs"}, `${item.dbfs} dBFS`),
-        h("span", {key: "gate"}, windowOutcomeLabel(item)),
-      ]),
-      h("svg", {key: "svg", className: "waveform", viewBox: "0 0 100 72", preserveAspectRatio: "none"}, [
-        h("line", {
-          key: "threshold",
-          className: "threshold-line",
-          x1: "0",
-          x2: "100",
-          y1: thresholdY,
-          y2: thresholdY,
-        }),
-        h("polyline", {key: "wave", className: "waveform-line", points: polyline}),
-      ]),
-      h("div", {key: "bottom", className: "waveform-meta"}, [
-        h("span", {key: "floor"}, `底噪 ${item.noise_floor_dbfs} dBFS`),
-        h("span", {key: "threshold"}, `阈值 ${item.trigger_threshold_dbfs} dBFS`),
-      ]),
-    ]);
+  function buildTimelineSeries(windows) {
+    const waveform = [];
+    const markers = [];
+    const thresholds = [];
+    const floors = [];
+    windows.forEach((item) => {
+      const startMs = timestampToMs(item.timestamp);
+      const durationMs = Math.max(1, Number(item.window_duration_seconds || 1) * 1000);
+      const endMs = startMs + durationMs;
+      const points = item.points || [];
+      points.forEach((point, pointIndex) => {
+        const ratio = points.length <= 1 ? 0.5 : pointIndex / (points.length - 1);
+        waveform.push({
+          id: `${item.timestamp}:wave:${pointIndex}`,
+          value: [
+            startMs + ratio * durationMs,
+            Number(point) || 0,
+          ],
+        });
+      });
+      const threshold = Math.max(0, Math.min(1, Number(item.trigger_threshold_rms || 0) / 32768));
+      const floor = Math.max(0, Math.min(1, Number(item.noise_floor_rms || 0) / 32768));
+      thresholds.push(
+        {id: `${item.timestamp}:threshold:p0`, value: [startMs, threshold]},
+        {id: `${item.timestamp}:threshold:p1`, value: [endMs, threshold]},
+        {id: `${item.timestamp}:threshold:gap0`, value: [endMs, null]},
+        {id: `${item.timestamp}:threshold:n0`, value: [startMs, -threshold]},
+        {id: `${item.timestamp}:threshold:n1`, value: [endMs, -threshold]},
+        {id: `${item.timestamp}:threshold:gap1`, value: [endMs, null]},
+      );
+      floors.push(
+        {id: `${item.timestamp}:floor:p0`, value: [startMs, floor]},
+        {id: `${item.timestamp}:floor:p1`, value: [endMs, floor]},
+        {id: `${item.timestamp}:floor:gap0`, value: [endMs, null]},
+        {id: `${item.timestamp}:floor:n0`, value: [startMs, -floor]},
+        {id: `${item.timestamp}:floor:n1`, value: [endMs, -floor]},
+        {id: `${item.timestamp}:floor:gap1`, value: [endMs, null]},
+      );
+      const outcome = windowOutcome(item);
+      markers.push({
+        id: `${item.timestamp}:marker`,
+        value: [startMs + durationMs / 2, -0.5],
+        itemStyle: {color: OUTCOME_COLORS[outcome] || OUTCOME_COLORS.ignored},
+        name: windowOutcomeLabel(item),
+        window: item,
+      });
+    });
+    return {waveform, markers, thresholds, floors};
   }
 
-  function WaveformMonitor({status, autoRefresh, onAutoRefreshChange}) {
+  function EChartTimeline({windows}) {
+    const chartRef = useRef(null);
+    const instanceRef = useRef(null);
+    const lastSignatureRef = useRef("");
+    const windowsRef = useRef([]);
+
+    useEffect(() => {
+      if (!chartRef.current || !window.echarts) {
+        return undefined;
+      }
+      instanceRef.current = window.echarts.init(chartRef.current, null, {renderer: "canvas"});
+      const handleResize = () => instanceRef.current && instanceRef.current.resize();
+      window.addEventListener("resize", handleResize);
+      return () => {
+        window.removeEventListener("resize", handleResize);
+        instanceRef.current.dispose();
+        instanceRef.current = null;
+      };
+    }, []);
+
+    useEffect(() => {
+      const chart = instanceRef.current;
+      if (!chart) {
+        return;
+      }
+      lastSignatureRef.current = windows.length ? windowSignature(windows[windows.length - 1]) : "";
+      windowsRef.current = windows.slice(-WINDOW_LIMIT);
+      const {waveform, markers, thresholds, floors} = buildTimelineSeries(windowsRef.current);
+      chart.setOption({
+        animation: true,
+        animationDuration: 260,
+        animationDurationUpdate: 420,
+        animationEasing: "cubicOut",
+        animationEasingUpdate: "cubicOut",
+        backgroundColor: "transparent",
+        grid: {
+          left: 42,
+          right: 18,
+          top: 22,
+          bottom: 52,
+        },
+        tooltip: {
+          trigger: "item",
+          formatter: (params) => {
+            if (!params.data || !params.data.window) {
+              return "";
+            }
+            const item = params.data.window;
+            return [
+              windowOutcomeLabel(item),
+              `RMS: ${item.rms || 0}`,
+              `dBFS: ${item.dbfs || 0}`,
+              `阈值: ${item.trigger_threshold_rms || 0} RMS`,
+              `底噪: ${item.noise_floor_rms || 0} RMS`,
+            ].join("<br>");
+          },
+        },
+        xAxis: {
+          type: "time",
+          axisLabel: {
+            formatter: (value) => dayjs(value).format("HH:mm:ss"),
+            color: "rgba(31, 26, 20, 0.58)",
+          },
+          axisLine: {lineStyle: {color: "rgba(31, 26, 20, 0.22)"}},
+          axisTick: {show: false},
+          splitLine: {lineStyle: {color: "rgba(31, 26, 20, 0.1)"}},
+        },
+        yAxis: [
+          {
+            type: "value",
+            scale: true,
+            animation: false,
+            axisLabel: {
+              formatter: (value) => (Math.abs(value) <= 1 ? value.toFixed(2) : ""),
+              color: "rgba(31, 26, 20, 0.58)",
+            },
+            axisLine: {show: false},
+            axisTick: {show: false},
+            splitLine: {lineStyle: {color: "rgba(31, 26, 20, 0.08)"}},
+          },
+          {
+            type: "value",
+            min: -0.6,
+            max: 0.5,
+            show: false,
+          },
+        ],
+        series: [
+          {
+            id: "threshold",
+            name: "阈值",
+            type: "line",
+            yAxisIndex: 0,
+            data: thresholds,
+            symbol: "none",
+            connectNulls: false,
+            lineStyle: {
+              color: "rgba(159, 79, 42, 0.7)",
+              width: 1,
+              type: "dashed",
+            },
+            silent: true,
+          },
+          {
+            id: "floor",
+            name: "底噪",
+            type: "line",
+            yAxisIndex: 0,
+            data: floors,
+            symbol: "none",
+            connectNulls: false,
+            lineStyle: {
+              color: "rgba(31, 26, 20, 0.26)",
+              width: 1,
+              type: "dotted",
+            },
+            silent: true,
+          },
+          {
+            id: "waveform",
+            name: "波形",
+            type: "line",
+            yAxisIndex: 0,
+            data: waveform,
+            symbol: "none",
+            showSymbol: false,
+            sampling: "lttb",
+            lineStyle: {
+              color: "rgba(31, 26, 20, 0.78)",
+              width: 1,
+            },
+            emphasis: {disabled: true},
+          },
+          {
+            id: "markers",
+            name: "判定",
+            type: "scatter",
+            yAxisIndex: 1,
+            data: markers,
+            symbolSize: 9,
+            encode: {x: 0, y: 1},
+            z: 5,
+          },
+        ],
+      }, {
+        notMerge: true,
+        lazyUpdate: false,
+      });
+    }, []);
+
+    useEffect(() => {
+      const chart = instanceRef.current;
+      if (!chart) {
+        return;
+      }
+      const latest = windows[windows.length - 1];
+      const latestSignature = latest ? windowSignature(latest) : "";
+      if (!latest || latestSignature === lastSignatureRef.current) {
+        return;
+      }
+
+      windowsRef.current = [...windowsRef.current, latest].slice(-WINDOW_LIMIT);
+      const {waveform, markers, thresholds, floors} = buildTimelineSeries(windowsRef.current);
+      chart.setOption({
+        series: [
+          {id: "threshold", data: thresholds},
+          {id: "floor", data: floors},
+          {id: "waveform", data: waveform},
+          {id: "markers", data: markers},
+        ],
+      }, {
+        notMerge: false,
+        lazyUpdate: false,
+      });
+      lastSignatureRef.current = latestSignature;
+    }, [windows]);
+
+    if (!window.echarts) {
+      return h("div", {className: "empty"}, "图表库加载中...");
+    }
+    return h("div", {className: "echart-timeline", ref: chartRef});
+  }
+
+  function WaveformMonitor({status, autoRefresh, onAutoRefreshChange, onCalibrate}) {
     const windows = status.recent_detection_windows || [];
+    const latestWindow = windows[windows.length - 1] || {};
+
     return h("section", {className: "monitor-panel"}, [
       h("div", {key: "header", className: "monitor-header"}, [
         h("div", {key: "title"}, [
           h("h2", {key: "h2", className: "monitor-title"}, "最近 10 个判定窗口"),
-          h("div", {key: "hint", className: "muted"}, "阈值线按当前动态门限映射；刷新间隔与判定窗口一致。"),
+          h("div", {key: "hint", className: "muted"}, "仅当窗口命中目标标签时，才录制完整片段并写入事件记录"),
         ]),
-        h("label", {key: "toggle", className: "refresh-toggle"}, [
-          h("input", {
-            key: "input",
-            type: "checkbox",
-            checked: autoRefresh,
-            onChange: (event) => onAutoRefreshChange(event.target.checked),
-          }),
-          "自动刷新",
+        h("div", {key: "actions", className: "monitor-actions"}, [
+          h("button", {
+            key: "calibrate",
+            className: "button secondary",
+            type: "button",
+            disabled: status.is_calibrating,
+            onClick: onCalibrate,
+          }, status.is_calibrating ? "校准中..." : "校准阈值"),
+          h("label", {key: "toggle", className: "refresh-toggle"}, [
+            h("input", {
+              key: "input",
+              type: "checkbox",
+              checked: autoRefresh,
+              onChange: (event) => onAutoRefreshChange(event.target.checked),
+            }),
+            "自动刷新",
+          ]),
         ]),
       ]),
       windows.length
-        ? h("div", {key: "grid", className: "waveform-grid"}, windows.map((item, index) => (
-          h(WaveformCard, {key: index, item, index: index + 1})
-        )))
+        ? h("div", {key: "timeline", className: "combined-waveform"}, [
+          h(EChartTimeline, {key: "chart", windows}),
+          h("div", {key: "legend", className: "timeline-legend"}, [
+            h("span", {key: "ignored", className: "legend-item outcome-ignored"}, "已忽略"),
+            h("span", {key: "calibrated", className: "legend-item outcome-calibrated"}, "已校准"),
+            h("span", {key: "detected", className: "legend-item outcome-detected"}, "已检测"),
+            h("span", {key: "recorded", className: "legend-item outcome-recorded"}, "已记录"),
+            h("span", {key: "latest", className: "timeline-latest"}, `最新：${windowOutcomeLabel(latestWindow)} / ${latestWindow.rms || 0} RMS`),
+          ]),
+        ])
         : h("div", {key: "empty", className: "empty"}, "尚无判定窗口数据。"),
     ]);
   }
@@ -308,9 +558,19 @@
       loadEvents(emptyFilters).then(() => setError("")).catch((err) => setError(err.message));
     }
 
+    async function calibrateThreshold() {
+      try {
+        setError("");
+        const nextStatus = await fetchJson("/api/calibrate", {method: "POST"});
+        setStatus(nextStatus);
+      } catch (err) {
+        setError(err.message);
+      }
+    }
+
     return h(React.Fragment, null, [
       h("h1", {key: "title"}, "噪音监测面板"),
-      h("p", {key: "intro"}, "系统会按固定检测窗口采集音频并运行分类，仅当窗口命中目标交通类标签时，才录制完整片段并写入事件记录。"),
+      h("p", {key: "intro"}, "系统会按固定检测窗口采集音频并运行分类"),
       h(Tabs, {key: "tabs", activeTab, onChange: setActiveTab}),
       error ? h("div", {key: "error", className: "error"}, error) : null,
       activeTab === "status"
@@ -322,6 +582,7 @@
             status,
             autoRefresh,
             onAutoRefreshChange: setAutoRefresh,
+            onCalibrate: calibrateThreshold,
           }),
         ])
         : h("section", {key: "events-tab", className: "tab-panel"}, [

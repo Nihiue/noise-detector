@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -106,6 +107,7 @@ class CollectorAndMainTests(unittest.TestCase):
             detection_config=DetectionConfig(
                 window_seconds=0.1,
                 capture_seconds=0.1,
+                threshold_stddev_multiplier=1.0,
             ),
             event_store=EventStore(
                 records_dir=base / "records",
@@ -204,6 +206,7 @@ class CollectorAndMainTests(unittest.TestCase):
                 detection_config=DetectionConfig(
                     window_seconds=0.1,
                     capture_seconds=0.1,
+                    threshold_stddev_multiplier=1.0,
                 ),
                 event_store=EventStore(
                     records_dir=base / "records",
@@ -214,9 +217,7 @@ class CollectorAndMainTests(unittest.TestCase):
             )
             service._audio_input_factory = factory
             service._recovery_wait_seconds = 0.0
-            service._noise_gate._history.extend(
-                [-50.0] * service._noise_gate._MIN_WARMUP_WINDOWS
-            )
+            service._noise_gate.calibrate(np.full(1024, 120, dtype=np.int16))
             def append_and_stop(event) -> None:
                 service._stop_event.set()
 
@@ -244,9 +245,7 @@ class CollectorAndMainTests(unittest.TestCase):
     def test_retained_classification_captures_full_duration(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             service = self._make_service(Path(tmpdir))
-            service._noise_gate._history.extend(
-                [-50.0] * service._noise_gate._MIN_WARMUP_WINDOWS
-            )
+            service._noise_gate.calibrate(np.full(1024, 120, dtype=np.int16))
             detect_chunk = np.full(1024, 500, dtype=np.int16)
             capture_chunk = np.full(1024, 1500, dtype=np.int16)
             remaining = [detect_chunk, capture_chunk, capture_chunk]
@@ -274,8 +273,16 @@ class CollectorAndMainTests(unittest.TestCase):
                 service.get_status().recent_detection_windows[-1]["outcome"],
                 "recorded",
             )
+            self.assertGreaterEqual(
+                sum(
+                    1
+                    for item in service.get_status().recent_detection_windows
+                    if item["outcome"] == "recorded"
+                ),
+                2,
+            )
 
-    def test_event_classification_uses_final_recording_audio(self) -> None:
+    def test_event_classification_uses_trigger_window_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             classifier = StubClassifier(
                 results=[
@@ -292,9 +299,7 @@ class CollectorAndMainTests(unittest.TestCase):
                 ]
             )
             service = self._make_service(Path(tmpdir), classifier=classifier)
-            service._noise_gate._history.extend(
-                [-50.0] * service._noise_gate._MIN_WARMUP_WINDOWS
-            )
+            service._noise_gate.calibrate(np.full(1024, 120, dtype=np.int16))
             detect_chunk = np.full(1024, 500, dtype=np.int16)
             capture_chunk = np.full(1024, 3000, dtype=np.int16)
             remaining = [detect_chunk, capture_chunk, capture_chunk]
@@ -316,10 +321,10 @@ class CollectorAndMainTests(unittest.TestCase):
 
             events = service.event_store.query_events()
             self.assertEqual(len(events), 1)
-            self.assertEqual(events[0].classification, "Speech")
-            self.assertEqual(events[0].classification_score, 0.8)
-            self.assertEqual(events[0].top_classes, ["Speech:0.800", "Engine:0.400"])
-            self.assertEqual(classifier.calls, 2)
+            self.assertEqual(events[0].classification, "Engine")
+            self.assertEqual(events[0].classification_score, 0.9)
+            self.assertEqual(events[0].top_classes, ["Engine:0.900", "Noise:0.200"])
+            self.assertEqual(classifier.calls, 1)
 
     def test_top3_match_is_retained_even_when_top1_is_not_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -334,9 +339,7 @@ class CollectorAndMainTests(unittest.TestCase):
                     ],
                 ),
             )
-            service._noise_gate._history.extend(
-                [-50.0] * service._noise_gate._MIN_WARMUP_WINDOWS
-            )
+            service._noise_gate.calibrate(np.full(1024, 120, dtype=np.int16))
             detect_chunk = np.full(1024, 500, dtype=np.int16)
             capture_chunk = np.full(1024, 1500, dtype=np.int16)
             remaining = [detect_chunk, capture_chunk, capture_chunk]
@@ -364,35 +367,90 @@ class CollectorAndMainTests(unittest.TestCase):
                 ["Speech:0.900", "Engine:0.700", "Noise:0.200"],
             )
 
-    def test_noise_gate_warms_up_before_running_classifier(self) -> None:
+    def test_noise_gate_requires_calibration_before_running_classifier(self) -> None:
         gate = _NoiseFloorGate(detection_window_seconds=0.1)
-        decisions = [gate.evaluate(200.0) for _ in range(gate._MIN_WARMUP_WINDOWS + 1)]
+        decision = gate.evaluate(200.0)
 
-        self.assertTrue(all(not item.should_classify for item in decisions))
-        self.assertFalse(decisions[0].is_ready)
-        self.assertTrue(decisions[-1].is_ready)
+        self.assertFalse(decision.should_classify)
+        self.assertFalse(decision.is_ready)
 
     def test_noise_gate_opens_for_signal_above_background(self) -> None:
         gate = _NoiseFloorGate(detection_window_seconds=0.1)
-        for _ in range(gate._MIN_WARMUP_WINDOWS):
-            gate.evaluate(150.0)
+        calibration = gate.calibrate(np.full(1024, 150, dtype=np.int16))
 
         decision = gate.evaluate(2500.0)
 
+        self.assertTrue(calibration.is_ready)
         self.assertTrue(decision.should_classify)
-        self.assertGreater(decision.current_dbfs, decision.trigger_threshold_dbfs)
+        self.assertGreater(decision.current_rms, decision.trigger_threshold_rms)
 
-    def test_noise_gate_does_not_relearn_sustained_foreground_noise(self) -> None:
+    def test_noise_gate_threshold_uses_calibration_rms_mean_and_stddev(self) -> None:
         gate = _NoiseFloorGate(detection_window_seconds=0.1)
-        for _ in range(gate._MIN_WARMUP_WINDOWS):
-            gate.evaluate(120.0)
+        samples = np.concatenate(
+            [
+                np.full(500, 100, dtype=np.int16),
+                np.full(500, 200, dtype=np.int16),
+            ]
+        )
 
-        initial_floor = gate.evaluate(120.0).noise_floor_dbfs
+        calibration = gate.calibrate(samples)
+        below_threshold = gate.evaluate(140.0)
+        above_threshold = gate.evaluate(180.0)
+
+        self.assertAlmostEqual(calibration.noise_floor_rms, 150.0)
+        self.assertAlmostEqual(calibration.noise_floor_std_rms, 50.0)
+        self.assertAlmostEqual(calibration.trigger_threshold_rms, 200.0)
+        self.assertFalse(below_threshold.should_classify)
+        self.assertFalse(above_threshold.should_classify)
+        self.assertTrue(gate.evaluate(220.0).should_classify)
+
+    def test_noise_gate_uses_configured_stddev_multiplier(self) -> None:
+        gate = _NoiseFloorGate(
+            detection_window_seconds=0.1,
+            threshold_stddev_multiplier=2.0,
+        )
+        samples = np.concatenate(
+            [
+                np.full(500, 100, dtype=np.int16),
+                np.full(500, 200, dtype=np.int16),
+            ]
+        )
+
+        calibration = gate.calibrate(samples)
+
+        self.assertAlmostEqual(calibration.noise_floor_rms, 150.0)
+        self.assertAlmostEqual(calibration.noise_floor_std_rms, 50.0)
+        self.assertAlmostEqual(calibration.trigger_threshold_rms, 250.0)
+        self.assertFalse(gate.evaluate(220.0).should_classify)
+        self.assertTrue(gate.evaluate(260.0).should_classify)
+
+    def test_noise_gate_keeps_floor_until_next_calibration(self) -> None:
+        gate = _NoiseFloorGate(detection_window_seconds=0.1)
+        initial_floor = gate.calibrate(np.full(1024, 120, dtype=np.int16)).noise_floor_rms
+
         for _ in range(50):
             gate.evaluate(6000.0)
-        later_floor = gate.evaluate(120.0).noise_floor_dbfs
+        later_floor = gate.evaluate(120.0).noise_floor_rms
 
         self.assertLess(abs(later_floor - initial_floor), 1.0)
+
+    def test_detection_window_preview_includes_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = self._make_service(Path(tmpdir))
+            decision = service._noise_gate.calibrate(np.full(1024, 120, dtype=np.int16))
+
+            service._remember_detection_window(
+                np.full(1024, 120, dtype=np.int16),
+                120.0,
+                decision,
+            )
+
+            timestamp = service._get_detection_window_previews()[0]["timestamp"]
+            self.assertIsNotNone(datetime.fromisoformat(str(timestamp)))
+            self.assertEqual(
+                service._get_detection_window_previews()[0]["window_duration_seconds"],
+                0.1,
+            )
 
     def test_run_loop_skips_classification_when_gate_stays_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -451,7 +509,11 @@ class CollectorAndMainTests(unittest.TestCase):
                         chunk_size=1024,
                         sample_format="int16",
                     ),
-                    "detection": DetectionConfig(window_seconds=0.1, capture_seconds=0.1),
+                    "detection": DetectionConfig(
+                        window_seconds=0.1,
+                        capture_seconds=0.1,
+                        threshold_stddev_multiplier=1.0,
+                    ),
                     "app": type("AppStub", (), {"host": "127.0.0.1", "port": 8000})(),
                 },
             )()

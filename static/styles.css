@@ -116,57 +116,78 @@ p {
   font-size: 0.92rem;
 }
 
+.monitor-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
 .refresh-toggle input {
   accent-color: var(--accent);
 }
 
-.waveform-grid {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.waveform-card {
-  padding: 10px;
+.combined-waveform {
   background: #fffaf0;
   border: 1px solid var(--line);
 }
 
-.waveform-card.gate-open {
-  border-color: rgba(159, 79, 42, 0.7);
-  box-shadow: inset 0 0 0 1px rgba(159, 79, 42, 0.22);
+.echart-timeline {
+  height: 320px;
 }
 
-.waveform-meta {
+.legend-item.outcome-calibrated::before {
+  background: #2f7f68;
+}
+
+.legend-item.outcome-detected::before {
+  background: #2f5f9f;
+}
+
+.legend-item.outcome-recorded::before {
+  background: var(--accent);
+}
+
+.timeline-window.outcome-calibrated .timeline-outcome-marker {
+  fill: #2f7f68;
+}
+
+.timeline-window.outcome-detected .timeline-outcome-marker {
+  fill: #2f5f9f;
+}
+
+.timeline-window.outcome-recorded .timeline-outcome-marker {
+  fill: var(--accent);
+}
+
+.timeline-legend {
   display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px 18px;
+  padding: 10px 12px 12px;
   color: rgba(31, 26, 20, 0.72);
-  font-size: 0.84rem;
+  font-size: 0.88rem;
 }
 
-.waveform {
-  display: block;
-  width: 100%;
-  height: 72px;
-  background:
-    linear-gradient(180deg, transparent 49%, rgba(31, 26, 20, 0.16) 50%, transparent 51%),
-    linear-gradient(90deg, rgba(212, 199, 172, 0.35), transparent);
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
 }
 
-.waveform-line {
-  fill: none;
-  stroke: var(--accent);
-  stroke-width: 2;
-  stroke-linejoin: round;
-  stroke-linecap: round;
+.legend-item::before {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(31, 26, 20, 0.35);
+  content: "";
 }
 
-.threshold-line {
-  stroke: rgba(31, 26, 20, 0.48);
-  stroke-dasharray: 4 4;
-  stroke-width: 1;
+.timeline-latest {
+  margin-left: auto;
+  color: var(--ink);
 }
 
 .controls {
@@ -216,6 +237,11 @@ p {
 .button.secondary {
   background: transparent;
   color: var(--accent);
+}
+
+.button:disabled {
+  cursor: wait;
+  opacity: 0.58;
 }
 
 table {

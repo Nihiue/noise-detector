@@ -11,6 +11,7 @@ audio:
 detection:
   window_seconds: 3.0
   capture_seconds: 15.0
+  threshold_stddev_multiplier: 1.0
 
 storage:
   records_dir: data/records
@@ -39,7 +40,6 @@ classification:
     - Bus
     - Traffic noise, roadway noise
     - Zipper (clothing)
-    - Radio
     - Aircraft
     - Jet engine
     - Aircraft engine

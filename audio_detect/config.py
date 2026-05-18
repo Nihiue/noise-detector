@@ -25,6 +25,7 @@ class AudioConfig:
 class DetectionConfig:
     window_seconds: float
     capture_seconds: float
+    threshold_stddev_multiplier: float
 
 
 @dataclass
@@ -84,7 +85,7 @@ def load_settings(config_path: Optional[Union[Path, str]] = None) -> Settings:
             chunk_size=payload["audio"]["chunk_size"],
             sample_format=payload["audio"]["format"],
         ),
-        detection=DetectionConfig(**payload["detection"]),
+        detection=_resolve_detection_config(payload["detection"]),
         storage=StorageConfig(
             records_dir=_resolve_path(base_dir, payload["storage"]["records_dir"]),
             database_path=_resolve_path(base_dir, payload["storage"]["database_path"]),
@@ -112,6 +113,14 @@ def _resolve_classification_config(
         model_path=_resolve_path(base_dir, payload["model_path"]),
         class_map_path=_resolve_path(base_dir, payload["class_map_path"]),
         retained_labels=list(payload.get("retained_labels", [])),
+    )
+
+
+def _resolve_detection_config(payload: dict[str, Any]) -> DetectionConfig:
+    return DetectionConfig(
+        window_seconds=payload["window_seconds"],
+        capture_seconds=payload["capture_seconds"],
+        threshold_stddev_multiplier=payload.get("threshold_stddev_multiplier", 1.0),
     )
 
 

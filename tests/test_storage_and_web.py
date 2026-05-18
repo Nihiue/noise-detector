@@ -21,23 +21,48 @@ from audio_detect.web import create_app
 
 
 class DummyCollector:
+    def __init__(self) -> None:
+        self.calibration_requests = 0
+
     def get_status(self) -> CollectorRuntimeStatus:
         return CollectorRuntimeStatus(
             is_running=True,
             detection_window_seconds=3.0,
+            noise_floor_rms=100.0,
+            noise_floor_std_rms=12.0,
+            trigger_threshold_rms=112.0,
             trigger_threshold_dbfs=-42.0,
             noise_floor_dbfs=-51.0,
             recent_detection_windows=[
                 {
+                    "timestamp": "2026-05-18T04:00:00+00:00",
+                    "window_duration_seconds": 3.0,
                     "points": [0.0, 0.4, -0.2],
                     "rms": 100.0,
                     "dbfs": -38.0,
+                    "noise_floor_rms": 100.0,
+                    "noise_floor_std_rms": 12.0,
+                    "trigger_threshold_rms": 112.0,
                     "noise_floor_dbfs": -51.0,
                     "trigger_threshold_dbfs": -42.0,
                     "gate_open": True,
                     "outcome": "recorded",
                 }
             ],
+        )
+
+    def request_calibration(self) -> CollectorRuntimeStatus:
+        self.calibration_requests += 1
+        return CollectorRuntimeStatus(
+            is_running=True,
+            detection_window_seconds=3.0,
+            noise_floor_rms=100.0,
+            noise_floor_std_rms=12.0,
+            trigger_threshold_rms=112.0,
+            trigger_threshold_dbfs=-42.0,
+            noise_floor_dbfs=-42.0,
+            gate_ready=True,
+            is_calibrating=True,
         )
 
 
@@ -59,6 +84,7 @@ class StorageAndWebTests(unittest.TestCase):
             detection=DetectionConfig(
                 window_seconds=4.0,
                 capture_seconds=12.0,
+                threshold_stddev_multiplier=1.0,
             ),
             storage=StorageConfig(
                 records_dir=self.records_dir,
@@ -75,9 +101,10 @@ class StorageAndWebTests(unittest.TestCase):
             retention=RetentionConfig(max_record_days=7, max_records=100),
             logging=LoggingConfig(level="INFO", file_path=base / "logs" / "app.log"),
         )
+        self.collector = DummyCollector()
         self.app = create_app(
             self.event_store,
-            DummyCollector(),
+            self.collector,
         )
         self.client = self.app.test_client()
 
@@ -108,6 +135,7 @@ class StorageAndWebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("\u566a\u97f3\u76d1\u6d4b\u9762\u677f".encode(), response.data)
         self.assertIn(b"dayjs.min.js", response.data)
+        self.assertIn(b"echarts.min.js", response.data)
         self.assertIn(b"https://unpkg.byted-static.com/react/18.1.0/umd/react.production.min.js", response.data)
         self.assertIn(b"/static/app.js", response.data)
         self.assertIn(b"/static/styles.css", response.data)
@@ -121,10 +149,15 @@ class StorageAndWebTests(unittest.TestCase):
         self.assertIn(b"tab-button", app_response.data)
         self.assertIn(b'localStorage.getItem("audio-detect:auto-refresh") !== "0"', app_response.data)
         self.assertIn(b"setInterval", app_response.data)
+        self.assertIn(b"/api/calibrate", app_response.data)
+        self.assertIn("\u6821\u51c6\u9608\u503c".encode(), app_response.data)
         self.assertIn("\u5df2\u68c0\u6d4b".encode(), app_response.data)
         self.assertIn("\u5df2\u8bb0\u5f55".encode(), app_response.data)
+        self.assertIn(b"combined-waveform", app_response.data)
+        self.assertIn(b"echart-timeline", app_response.data)
+        self.assertIn(b"animationDurationUpdate", app_response.data)
         self.assertIn(b"grid-template-columns: repeat(4", css_response.data)
-        self.assertIn(b"grid-template-columns: repeat(5", css_response.data)
+        self.assertIn(b".echart-timeline", css_response.data)
 
     def test_api_status_returns_detection_window_monitor_data(self) -> None:
         response = self.client.get("/api/status")
@@ -132,9 +165,25 @@ class StorageAndWebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["detection_window_seconds"], 3.0)
+        self.assertEqual(payload["noise_floor_rms"], 100.0)
+        self.assertEqual(payload["noise_floor_std_rms"], 12.0)
+        self.assertEqual(payload["trigger_threshold_rms"], 112.0)
         self.assertEqual(payload["trigger_threshold_dbfs"], -42.0)
+        self.assertFalse(payload["is_calibrating"])
+        self.assertEqual(
+            payload["recent_detection_windows"][0]["timestamp"],
+            "2026-05-18T04:00:00+00:00",
+        )
+        self.assertEqual(payload["recent_detection_windows"][0]["window_duration_seconds"], 3.0)
         self.assertEqual(payload["recent_detection_windows"][0]["points"], [0.0, 0.4, -0.2])
         self.assertEqual(payload["recent_detection_windows"][0]["outcome"], "recorded")
+
+    def test_api_calibrate_requests_threshold_calibration(self) -> None:
+        response = self.client.post("/api/calibrate")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.collector.calibration_requests, 1)
+        self.assertTrue(response.get_json()["is_calibrating"])
 
     def test_api_classifications_returns_distinct_values(self) -> None:
         self.event_store.append(

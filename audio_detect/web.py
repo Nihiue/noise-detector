@@ -26,6 +26,10 @@ def create_app(
     def api_status():
         return jsonify(_status_to_dict(collector.get_status()))
 
+    @app.post("/api/calibrate")
+    def api_calibrate():
+        return jsonify(_status_to_dict(collector.request_calibration()))
+
     @app.get("/api/events")
     def api_events():
         filters = _read_event_filters()
@@ -82,9 +86,13 @@ def _status_to_dict(status) -> dict[str, object]:
         "last_peak_dbfs": status.last_peak_dbfs,
         "detection_window_seconds": status.detection_window_seconds,
         "capture_seconds": status.capture_seconds,
+        "noise_floor_rms": status.noise_floor_rms,
+        "noise_floor_std_rms": status.noise_floor_std_rms,
+        "trigger_threshold_rms": status.trigger_threshold_rms,
         "noise_floor_dbfs": status.noise_floor_dbfs,
         "trigger_threshold_dbfs": status.trigger_threshold_dbfs,
         "gate_ready": status.gate_ready,
+        "is_calibrating": status.is_calibrating,
         "last_gate_open": status.last_gate_open,
         "recent_detection_windows": status.recent_detection_windows,
         "last_error": status.last_error,
