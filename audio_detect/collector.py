@@ -246,6 +246,9 @@ class AudioInput:
 
 
 class CollectorService:
+    _CLASSIFICATION_TARGET_RMS = 0.1
+    _CLASSIFICATION_MAX_PEAK = 0.95
+
     def __init__(
         self,
         audio_config: AudioConfig,
@@ -431,8 +434,9 @@ class CollectorService:
                     round(gate_decision.trigger_threshold_dbfs, 2),
                 )
                 continue
+            classification_audio = self._normalize_for_classification(detection_audio)
             classification = self.classifier.classify_samples(
-                detection_audio.astype(np.float32) / 32768.0,
+                classification_audio,
                 self.audio_config.sample_rate,
             )
             if not self.classifier.should_retain(classification):
@@ -560,6 +564,26 @@ class CollectorService:
     def _compute_rms(samples: np.ndarray) -> float:
         normalized = samples.astype(np.float32)
         return float(np.sqrt(np.mean(normalized * normalized)))
+
+    @classmethod
+    def _normalize_for_classification(cls, samples: np.ndarray) -> np.ndarray:
+        waveform = samples.astype(np.float32) / 32768.0
+        if waveform.size == 0:
+            return waveform
+
+        rms = float(np.sqrt(np.mean(waveform * waveform)))
+        peak = float(np.max(np.abs(waveform)))
+        if rms <= 0.0 or peak <= 0.0:
+            return waveform
+
+        target_gain = cls._CLASSIFICATION_TARGET_RMS / rms
+        peak_limited_gain = cls._CLASSIFICATION_MAX_PEAK / peak
+        gain = max(1.0, min(target_gain, peak_limited_gain))
+        return np.clip(
+            waveform * gain,
+            -cls._CLASSIFICATION_MAX_PEAK,
+            cls._CLASSIFICATION_MAX_PEAK,
+        ).astype(np.float32)
 
     def _compute_duration_seconds(self, samples: np.ndarray) -> float:
         return round(float(samples.shape[0]) / float(self.audio_config.sample_rate), 6)

@@ -28,6 +28,7 @@ class StubClassifier:
         self.top_classes = top_classes or [f"{self.label}:1.000"]
         self.results = list(results or [])
         self.calls = 0
+        self.last_samples: np.ndarray | None = None
 
     def classify(self, recording_path: Path) -> ClassificationResult:
         return self.classify_samples(np.array([], dtype=np.float32), 16000)
@@ -38,6 +39,7 @@ class StubClassifier:
         sample_rate: int,
     ) -> ClassificationResult:
         self.calls += 1
+        self.last_samples = samples.copy()
         if self.results:
             return self.results.pop(0)
         return ClassificationResult(
@@ -325,6 +327,60 @@ class CollectorAndMainTests(unittest.TestCase):
             self.assertEqual(events[0].classification_score, 0.9)
             self.assertEqual(events[0].top_classes, ["Engine:0.900", "Noise:0.200"])
             self.assertEqual(classifier.calls, 1)
+
+    def test_classification_input_is_normalized_without_changing_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            classifier = StubClassifier()
+            service = self._make_service(Path(tmpdir), classifier=classifier)
+            service._noise_gate.calibrate(np.full(1024, 20, dtype=np.int16))
+            detect_chunk = np.full(1024, 100, dtype=np.int16)
+            capture_chunk = np.full(1024, 150, dtype=np.int16)
+            remaining = [detect_chunk, capture_chunk, capture_chunk]
+
+            def read_chunk() -> np.ndarray:
+                if remaining:
+                    return remaining.pop(0)
+                return capture_chunk
+
+            service.audio_input.read_chunk = read_chunk  # type: ignore[method-assign]
+            original_append = service.event_store.append
+
+            def append_and_stop(event) -> None:
+                original_append(event)
+                service._stop_event.set()
+
+            service.event_store.append = append_and_stop  # type: ignore[method-assign]
+            service._run_loop()
+
+            self.assertIsNotNone(classifier.last_samples)
+            self.assertAlmostEqual(
+                float(np.sqrt(np.mean(classifier.last_samples * classifier.last_samples))),
+                service._CLASSIFICATION_TARGET_RMS,
+                places=5,
+            )
+            recordings = list(service.event_store.records_dir.glob("*.wav"))
+            self.assertEqual(len(recordings), 1)
+            with recordings[0].open("rb") as handle:
+                payload = handle.read()
+            self.assertIn(detect_chunk.tobytes(), payload)
+
+    def test_classification_normalization_limits_peak_level(self) -> None:
+        samples = np.asarray([32767] + [0] * 1023, dtype=np.int16)
+
+        normalized = CollectorService._normalize_for_classification(samples)
+
+        self.assertLessEqual(float(np.max(np.abs(normalized))), 0.95)
+        self.assertLess(
+            float(np.sqrt(np.mean(normalized * normalized))),
+            CollectorService._CLASSIFICATION_TARGET_RMS,
+        )
+
+    def test_classification_normalization_does_not_reduce_loud_input(self) -> None:
+        samples = np.full(1024, 10000, dtype=np.int16)
+
+        normalized = CollectorService._normalize_for_classification(samples)
+
+        np.testing.assert_allclose(normalized, samples.astype(np.float32) / 32768.0)
 
     def test_top3_match_is_retained_even_when_top1_is_not_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
