@@ -50,3 +50,10 @@ def find_input_device(
                 return item
 
     return devices[0]
+
+
+def get_input_device_by_index(device_index: int) -> Optional[AudioDeviceInfo]:
+    for item in list_input_devices():
+        if item.index == device_index:
+            return item
+    return None

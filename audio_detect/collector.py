@@ -13,7 +13,12 @@ from typing import Optional, Protocol
 
 import numpy as np
 
-from audio_detect.audio_devices import AudioDeviceInfo, find_input_device
+from audio_detect.audio_devices import (
+    AudioDeviceInfo,
+    find_input_device,
+    get_input_device_by_index,
+    list_input_devices as list_available_input_devices,
+)
 from audio_detect.classifier import Classifier
 from audio_detect.config import AudioConfig, DetectionConfig
 from audio_detect.storage import EventStore, NoiseEvent
@@ -29,6 +34,7 @@ class CollectorRuntimeStatus:
     selected_device_index: Optional[int] = None
     selected_device_name: str = ""
     is_running: bool = False
+    is_switching_device: bool = False
     last_peak_rms: float = 0.0
     last_peak_dbfs: float = -90.0
     detection_window_seconds: float = 0.0
@@ -66,8 +72,10 @@ class _NoiseFloorGate:
         self,
         detection_window_seconds: float,
         threshold_stddev_multiplier: float = 1.0,
+        threshold_rms_offset: float = 100.0,
     ) -> None:
         self.threshold_stddev_multiplier = threshold_stddev_multiplier
+        self.threshold_rms_offset = threshold_rms_offset
         self._noise_floor_rms: Optional[float] = None
         self._noise_floor_std_rms: float = 0.0
         self._trigger_threshold_rms: Optional[float] = None
@@ -95,6 +103,7 @@ class _NoiseFloorGate:
         self._trigger_threshold_rms = (
             self._noise_floor_rms
             + self._noise_floor_std_rms * self.threshold_stddev_multiplier
+            + self.threshold_rms_offset
         )
         current_rms = float(self._compute_rms(samples))
 
@@ -168,19 +177,27 @@ class AudioInputLike(Protocol):
 
 
 class AudioInput:
-    def __init__(self, config: AudioConfig) -> None:
+    def __init__(self, config: AudioConfig, *, device_index: Optional[int] = None) -> None:
         self.config = config
         self._buffer: deque[np.ndarray] = deque()
         self._buffer_lock = threading.Lock()
         self._buffer_ready = threading.Condition(self._buffer_lock)
         self._stream = None
         self.last_error = ""
-        self.selected_device = find_input_device(
-            device_name=config.device_name,
+        self.selected_device = (
+            get_input_device_by_index(device_index)
+            if device_index is not None
+            else find_input_device(device_name=config.device_name)
         )
         if sd is None:
             raise RuntimeError("sounddevice backend is unavailable")
         if self.selected_device is None:
+            if device_index is not None:
+                raise RuntimeError(
+                    "no matching input device was found for index: {index}".format(
+                        index=device_index
+                    )
+                )
             raise RuntimeError("no matching input device was found")
         self._open_stream()
 
@@ -246,9 +263,6 @@ class AudioInput:
 
 
 class CollectorService:
-    _CLASSIFICATION_TARGET_RMS = 0.1
-    _CLASSIFICATION_MAX_PEAK = 0.95
-
     def __init__(
         self,
         audio_config: AudioConfig,
@@ -261,15 +275,14 @@ class CollectorService:
         self.detection_config = detection_config
         self.event_store = event_store
         self.classifier = classifier
-        self._audio_input_factory = None if audio_input is not None else lambda: AudioInput(audio_config)
+        self._selected_device_override_index: Optional[int] = None
+        self._audio_input_factory = None if audio_input is not None else self._build_audio_input
         self.audio_input = audio_input or self._create_audio_input()
         self.logger = logging.getLogger("audio_detect.collector")
-        self._noise_gate = _NoiseFloorGate(
-            detection_config.window_seconds,
-            threshold_stddev_multiplier=detection_config.threshold_stddev_multiplier,
-        )
+        self._noise_gate = self._create_noise_gate()
         self._recent_detection_windows: deque[dict[str, object]] = deque(maxlen=10)
         self._status_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self.status = CollectorRuntimeStatus(
             selected_device_index=(
                 self.audio_input.selected_device.index
@@ -297,22 +310,92 @@ class CollectorService:
         self._calibration_requested = threading.Event()
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self.logger.info(
-            "collector starting device_index=%s device_name=%s",
-            self.status.selected_device_index,
-            self.status.selected_device_name,
-        )
-        self._thread = threading.Thread(target=self._run, name="collector", daemon=True)
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self.logger.info(
+                "collector starting device_index=%s device_name=%s",
+                self.status.selected_device_index,
+                self.status.selected_device_name,
+            )
+            self._thread = threading.Thread(target=self._run, name="collector", daemon=True)
+            self._thread.start()
 
     def stop(self) -> None:
-        self._stop_event.set()
-        self.audio_input.close()
-        if self._thread:
-            self._thread.join(timeout=2.0)
+        with self._lifecycle_lock:
+            self._stop_collector_thread()
+            self._update_status(is_switching_device=False)
+
+    @property
+    def configured_device_name(self) -> Optional[str]:
+        return self.audio_config.device_name
+
+    def can_switch_input_device(self) -> bool:
+        return self._audio_input_factory is not None
+
+    def list_input_devices(self) -> list[AudioDeviceInfo]:
+        return list_available_input_devices()
+
+    def switch_input_device(self, device_index: int) -> CollectorRuntimeStatus:
+        with self._lifecycle_lock:
+            if self._audio_input_factory is None:
+                raise RuntimeError("device switching is unavailable for injected audio input")
+            current_index = (
+                self.audio_input.selected_device.index
+                if self.audio_input.selected_device is not None
+                else None
+            )
+            if current_index == device_index:
+                return self.get_status()
+
+            previous_override = self._selected_device_override_index
+            was_running = self._thread is not None and self._thread.is_alive()
+            self.logger.info(
+                "collector switching device current_index=%s next_index=%s",
+                current_index,
+                device_index,
+            )
+            self._update_status(
+                is_switching_device=True,
+                is_calibrating=False,
+                last_error="",
+            )
+            self._stop_collector_thread()
+            self._selected_device_override_index = device_index
+
+            try:
+                self.audio_input = self._create_audio_input()
+            except Exception as exc:
+                self.logger.exception("collector device switch failed")
+                self._selected_device_override_index = previous_override
+                rollback_error = None
+                try:
+                    self.audio_input = self._create_audio_input()
+                    self._reset_runtime_state_for_audio_input()
+                    if was_running:
+                        self.start()
+                except Exception as rollback_exc:
+                    rollback_error = rollback_exc
+                    self.logger.exception("collector device switch rollback failed")
+                message = "failed to switch input device: {error}".format(error=exc)
+                if rollback_error is not None:
+                    message += "; rollback failed: {error}".format(error=rollback_error)
+                self._update_status(
+                    is_running=bool(self._thread and self._thread.is_alive()),
+                    is_switching_device=False,
+                    last_error=message,
+                )
+                raise RuntimeError(message) from exc
+
+            self._reset_runtime_state_for_audio_input()
+            if was_running:
+                self.start()
+            self._update_status(
+                is_switching_device=False,
+                last_error=self.audio_input.last_error,
+            )
+            return self.get_status()
 
     def request_calibration(self) -> CollectorRuntimeStatus:
         self._calibration_requested.set()
@@ -434,9 +517,8 @@ class CollectorService:
                     round(gate_decision.trigger_threshold_dbfs, 2),
                 )
                 continue
-            classification_audio = self._normalize_for_classification(detection_audio)
             classification = self.classifier.classify_samples(
-                classification_audio,
+                detection_audio.astype(np.float32) / 32768.0,
                 self.audio_config.sample_rate,
             )
             if not self.classifier.should_retain(classification):
@@ -526,29 +608,19 @@ class CollectorService:
         return self._audio_input_factory()
 
     def _reset_audio_input(self) -> None:
-        try:
-            self.audio_input.close()
-        except Exception:
-            self.logger.exception("failed to close audio input during reset")
+        with self._lifecycle_lock:
+            try:
+                self.audio_input.close()
+            except Exception:
+                self.logger.exception("failed to close audio input during reset")
 
-        if self._audio_input_factory is None:
-            self.logger.warning("collector recovery unavailable for injected audio input")
-            return
+            if self._audio_input_factory is None:
+                self.logger.warning("collector recovery unavailable for injected audio input")
+                return
 
-        self.audio_input = self._create_audio_input()
-        self._update_status(
-            selected_device_index=(
-                self.audio_input.selected_device.index
-                if self.audio_input.selected_device is not None
-                else None
-            ),
-            selected_device_name=(
-                self.audio_input.selected_device.name
-                if self.audio_input.selected_device is not None
-                else ""
-            ),
-            last_error=self.audio_input.last_error,
-        )
+            self.audio_input = self._create_audio_input()
+            self._sync_selected_device_status()
+            self._update_status(last_error=self.audio_input.last_error)
 
     def _collect_chunk_batch(self, chunk_count: int) -> list[np.ndarray]:
         frames = []
@@ -564,26 +636,6 @@ class CollectorService:
     def _compute_rms(samples: np.ndarray) -> float:
         normalized = samples.astype(np.float32)
         return float(np.sqrt(np.mean(normalized * normalized)))
-
-    @classmethod
-    def _normalize_for_classification(cls, samples: np.ndarray) -> np.ndarray:
-        waveform = samples.astype(np.float32) / 32768.0
-        if waveform.size == 0:
-            return waveform
-
-        rms = float(np.sqrt(np.mean(waveform * waveform)))
-        peak = float(np.max(np.abs(waveform)))
-        if rms <= 0.0 or peak <= 0.0:
-            return waveform
-
-        target_gain = cls._CLASSIFICATION_TARGET_RMS / rms
-        peak_limited_gain = cls._CLASSIFICATION_MAX_PEAK / peak
-        gain = max(1.0, min(target_gain, peak_limited_gain))
-        return np.clip(
-            waveform * gain,
-            -cls._CLASSIFICATION_MAX_PEAK,
-            cls._CLASSIFICATION_MAX_PEAK,
-        ).astype(np.float32)
 
     def _compute_duration_seconds(self, samples: np.ndarray) -> float:
         return round(float(samples.shape[0]) / float(self.audio_config.sample_rate), 6)
@@ -646,6 +698,7 @@ class CollectorService:
                 selected_device_index=self.status.selected_device_index,
                 selected_device_name=self.status.selected_device_name,
                 is_running=self.status.is_running,
+                is_switching_device=self.status.is_switching_device,
                 last_peak_rms=self.status.last_peak_rms,
                 last_peak_dbfs=self.status.last_peak_dbfs,
                 detection_window_seconds=self.status.detection_window_seconds,
@@ -666,3 +719,69 @@ class CollectorService:
         with self._status_lock:
             for key, value in kwargs.items():
                 setattr(self.status, key, value)
+
+    def _build_audio_input(self) -> AudioInputLike:
+        return AudioInput(
+            self.audio_config,
+            device_index=self._selected_device_override_index,
+        )
+
+    def _create_noise_gate(self) -> _NoiseFloorGate:
+        return _NoiseFloorGate(
+            self.detection_config.window_seconds,
+            threshold_stddev_multiplier=self.detection_config.threshold_stddev_multiplier,
+            threshold_rms_offset=self.detection_config.threshold_rms_offset,
+        )
+
+    def _reset_runtime_state_for_audio_input(self) -> None:
+        self._noise_gate = self._create_noise_gate()
+        self._recent_detection_windows.clear()
+        self._calibration_requested.clear()
+        self._sync_selected_device_status()
+        self._update_status(
+            is_running=False,
+            last_peak_rms=0.0,
+            last_peak_dbfs=_NoiseFloorGate._SILENCE_FLOOR_DBFS,
+            noise_floor_rms=0.0,
+            noise_floor_std_rms=0.0,
+            trigger_threshold_rms=0.0,
+            noise_floor_dbfs=_NoiseFloorGate._SILENCE_FLOOR_DBFS,
+            trigger_threshold_dbfs=_NoiseFloorGate._SILENCE_FLOOR_DBFS,
+            gate_ready=False,
+            is_calibrating=False,
+            last_gate_open=False,
+            recent_detection_windows=[],
+            last_error=self.audio_input.last_error,
+        )
+
+    def _sync_selected_device_status(self) -> None:
+        self._update_status(
+            selected_device_index=(
+                self.audio_input.selected_device.index
+                if self.audio_input.selected_device is not None
+                else None
+            ),
+            selected_device_name=(
+                self.audio_input.selected_device.name
+                if self.audio_input.selected_device is not None
+                else ""
+            ),
+        )
+
+    def _stop_collector_thread(self) -> None:
+        self._stop_event.set()
+        try:
+            self.audio_input.close()
+        except Exception:
+            self.logger.exception("failed to close audio input while stopping collector")
+        thread = self._thread
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                raise RuntimeError("collector thread did not stop in time")
+        self._thread = None
+        self._update_status(is_running=False)

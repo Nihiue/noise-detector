@@ -33,7 +33,7 @@ Web 架构：
 2. `CollectorService` 按 `detection.window_seconds` 聚合检测窗口。
 3. `_NoiseFloorGate` 启动时把第一个判断窗口分桶计算 RMS 均值和标准差，并用 `均值 + K 个标准差` 作为阈值。
 4. 未超过当前校准阈值的窗口标记为 `ignored`。
-5. 超过阈值的窗口会先做分类专用音量标准化，再进入分类；未命中保留标签标记为 `detected`。
+5. 超过阈值的窗口直接进入分类；未命中保留标签标记为 `detected`。
 6. 命中保留标签后，触发窗口立即标记为 `recorded`，随后继续采集 `capture_seconds`。
 7. 录制期间仍按检测窗口分批发布 `recorded` 判定窗口，不再对这些录制期窗口运行分类。
 8. 录制完成后，将触发窗口和录制期窗口的原始 PCM 合并保存为一段录音，并用触发窗口的分类结果写入 SQLite。
@@ -41,7 +41,7 @@ Web 架构：
 阈值门控设计：
 
 - 启动后第一个判断窗口只用于校准底噪，不进入分类。
-- 底噪显示为校准窗口内分桶 RMS 的平均值，阈值为平均值加 `detection.threshold_stddev_multiplier` 倍标准差。
+- 底噪显示为校准窗口内分桶 RMS 的平均值，阈值为平均值加 `detection.threshold_stddev_multiplier` 倍标准差，再加 `detection.threshold_rms_offset` 固定 RMS 偏移量。
 - 当前窗口 RMS 只要高于校准阈值，就进入分类。
 - Web UI 的“校准阈值”按钮会请求采集器将下一个判断窗口作为新底噪样本并刷新阈值。
 - 阈值校准仍在采集线程内完成，避免 Web 请求线程和采集线程同时读取音频设备。

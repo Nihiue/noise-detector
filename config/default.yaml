@@ -12,6 +12,7 @@ detection:
   window_seconds: 3.0
   capture_seconds: 15.0
   threshold_stddev_multiplier: 1.0
+  threshold_rms_offset: 100.0
 
 storage:
   records_dir: data/records

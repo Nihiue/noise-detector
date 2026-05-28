@@ -192,7 +192,34 @@ p {
 
 .controls {
   margin: 0 0 24px;
-  padding: 16px;
+  padding: 12px 14px;
+}
+
+.device-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.device-panel-title {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 0.95rem;
+  letter-spacing: 0.04em;
+}
+
+.compact-note {
+  margin-bottom: 0;
+}
+
+.device-summary {
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  background: #fffaf0;
+  box-sizing: border-box;
 }
 
 .control-fields {
@@ -214,9 +241,15 @@ p {
 .actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   flex-wrap: wrap;
   gap: 12px;
-  margin-top: 14px;
+  margin-top: 10px;
+}
+
+.current-device-note {
+  margin-right: auto;
+  margin-bottom: 0;
 }
 
 .button {
@@ -246,10 +279,25 @@ p {
 
 table {
   width: 100%;
+  margin-top: 12px;
   border-collapse: collapse;
   background: var(--card);
   border: 1px solid var(--line);
   box-shadow: 0 18px 40px rgba(31, 26, 20, 0.08);
+}
+
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0 0 14px;
+}
+
+.pagination-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
 }
 
 th,
@@ -317,6 +365,20 @@ audio {
 
   .actions .button {
     flex: 1 1 100%;
+  }
+
+  .pagination-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .pagination-actions {
+    width: 100%;
+  }
+
+  .pagination-actions .button {
+    flex: 1 1 100%;
+    text-align: center;
   }
 
   .monitor-header {

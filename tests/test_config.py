@@ -37,6 +37,7 @@ class ConfigTests(unittest.TestCase):
                       window_seconds: 4.0
                       capture_seconds: 12.0
                       threshold_stddev_multiplier: 1.5
+                      threshold_rms_offset: 120.0
                     storage:
                       records_dir: ../runtime/data/records
                       database_path: ../runtime/data/audio.db
@@ -81,6 +82,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(settings.detection.window_seconds, 4.0)
             self.assertEqual(settings.detection.capture_seconds, 12.0)
             self.assertEqual(settings.detection.threshold_stddev_multiplier, 1.5)
+            self.assertEqual(settings.detection.threshold_rms_offset, 120.0)
             self.assertFalse(hasattr(settings.audio, "channels"))
 
     def test_detection_threshold_stddev_multiplier_defaults_to_one(self) -> None:
@@ -124,6 +126,7 @@ class ConfigTests(unittest.TestCase):
             settings = load_settings(config_path)
 
             self.assertEqual(settings.detection.threshold_stddev_multiplier, 1.0)
+            self.assertEqual(settings.detection.threshold_rms_offset, 100.0)
 
 
 if __name__ == "__main__":

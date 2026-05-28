@@ -14,6 +14,7 @@
     selected_device_index: null,
     selected_device_name: "",
     is_running: false,
+    is_switching_device: false,
     last_peak_rms: 0,
     last_peak_dbfs: -90,
     detection_window_seconds: 0,
@@ -37,6 +38,13 @@
         params.set(key, filters[key]);
       }
     });
+    return params.toString();
+  }
+
+  function buildEventQuery(filters, pagination) {
+    const params = new URLSearchParams(buildQuery(filters));
+    params.set("page", String(pagination.page || 1));
+    params.set("page_size", String(pagination.pageSize || 20));
     return params.toString();
   }
 
@@ -99,12 +107,12 @@
   }
 
   function StatusCards({status}) {
-    const device = status.selected_device_index !== null
-      ? `#${status.selected_device_index} ${status.selected_device_name}`
-      : status.selected_device_name;
     return h("section", {className: "status-grid"}, [
-      h(StatusCard, {key: "device", label: "输入设备", value: device}),
-      h(StatusCard, {key: "running", label: "采集状态", value: status.is_running ? "运行中" : "已停止"}),
+      h(StatusCard, {
+        key: "running",
+        label: "采集状态",
+        value: status.is_switching_device ? "切换设备中" : (status.is_running ? "运行中" : "已停止"),
+      }),
       h(StatusCard, {
         key: "window",
         label: "检测窗口 / 录制时长",
@@ -119,6 +127,66 @@
         label: "最近窗口",
         value: `${status.last_peak_dbfs} dBFS / ${windowOutcomeLabel((status.recent_detection_windows || []).slice(-1)[0] || {gate_open: status.last_gate_open})}`,
       }),
+    ]);
+  }
+
+  function AudioDevicePanel({
+    status,
+    devices,
+    canSwitch,
+    configuredDeviceName,
+    onSwitchDevice,
+  }) {
+    const [selectedIndex, setSelectedIndex] = useState(
+      status.selected_device_index !== null ? String(status.selected_device_index) : "",
+    );
+
+    useEffect(() => {
+      setSelectedIndex(status.selected_device_index !== null ? String(status.selected_device_index) : "");
+    }, [status.selected_device_index]);
+
+    return h("section", {className: "controls"}, [
+      h("div", {key: "head", className: "device-panel-head"}, [
+        h("div", {key: "copy"}, [
+          h("strong", {key: "title", className: "device-panel-title"}, "输入设备"),
+          h("div", {key: "hint", className: "muted compact-note"}, "切换会中断当前采集并触发重新校准。"),
+        ]),
+      ]),
+      h("div", {key: "fields", className: "control-fields"}, [
+        h("div", {key: "configured"}, [
+          h("label", {key: "label"}, "启动默认配置"),
+          h("div", {key: "value", className: "device-summary"}, configuredDeviceName || "未配置，默认使用首个可用设备"),
+        ]),
+        h("div", {key: "select"}, [
+          h("label", {key: "label", htmlFor: "audio-device-select"}, "切换到"),
+          h("select", {
+            key: "input",
+            id: "audio-device-select",
+            value: selectedIndex,
+            disabled: !canSwitch || status.is_switching_device || !devices.length,
+            onChange: (event) => setSelectedIndex(event.target.value),
+          }, devices.map((device) => h(
+            "option",
+            {key: String(device.index), value: String(device.index)},
+            `#${device.index} ${device.name}`,
+          ))),
+        ]),
+      ]),
+      h("div", {key: "actions", className: "actions"}, [
+        h("div", {key: "current-device", className: "muted current-device-note"}, `当前：${status.selected_device_name || "未选择"}`),
+        h("button", {
+          key: "switch",
+          className: "button secondary",
+          type: "button",
+          disabled: (
+            !canSwitch
+            || status.is_switching_device
+            || !selectedIndex
+            || String(status.selected_device_index) === selectedIndex
+          ),
+          onClick: () => onSwitchDevice(Number(selectedIndex)),
+        }, status.is_switching_device ? "切换中..." : "切换设备"),
+      ]),
     ]);
   }
 
@@ -458,24 +526,72 @@
     ]);
   }
 
-  function EventTable({events}) {
+  function PaginationControls({pagination, onPageChange}) {
+    const page = pagination.page || 1;
+    const totalPages = pagination.total_pages || 1;
+    const total = pagination.total || 0;
+    const pageSize = pagination.page_size || 20;
+    const start = total === 0 ? 0 : (page - 1) * pageSize + 1;
+    const end = total === 0 ? 0 : Math.min(total, page * pageSize);
+
+    return h("div", {className: "pagination-bar"}, [
+      h("div", {key: "summary", className: "muted"}, `第 ${page} / ${totalPages} 页，显示 ${start}-${end} 条，共 ${total} 条`),
+      h("div", {key: "actions", className: "pagination-actions"}, [
+        h("button", {
+          key: "prev",
+          className: "button secondary",
+          type: "button",
+          disabled: page <= 1,
+          onClick: () => onPageChange(page - 1),
+        }, "上一页"),
+        h("button", {
+          key: "next",
+          className: "button secondary",
+          type: "button",
+          disabled: page >= totalPages,
+          onClick: () => onPageChange(page + 1),
+        }, "下一页"),
+      ]),
+    ]);
+  }
+
+  function EventTable({events, pagination, onPageChange}) {
     if (!events.length) {
-      return h("div", {className: "empty"}, "暂无符合条件的事件。");
+      return h(React.Fragment, null, [
+        h(PaginationControls, {
+          key: "pagination-top",
+          pagination,
+          onPageChange,
+        }),
+        h("div", {key: "empty", className: "empty"}, "暂无符合条件的事件。"),
+      ]);
     }
 
-    return h("table", null, [
-      h("thead", {key: "head"}, h("tr", null, [
-        "时间", "峰值 RMS", "时长", "分类", "分数", "候选标签", "试听",
-      ].map((item) => h("th", {key: item}, item)))),
-      h("tbody", {key: "body"}, events.map((event) => h("tr", {key: `${event.timestamp}-${event.filename}`}, [
-        h("td", {key: "timestamp"}, formatTimestamp(event.timestamp)),
-        h("td", {key: "rms"}, event.peak_rms),
-        h("td", {key: "duration"}, `${event.duration_seconds}s`),
-        h("td", {key: "classification"}, h("span", {className: "tag"}, event.classification)),
-        h("td", {key: "score"}, event.classification_score),
-        h("td", {key: "classes"}, (event.top_classes || []).join(", ")),
-        h("td", {key: "audio"}, h("audio", {controls: true, preload: "none", src: event.record_url})),
-      ]))),
+    return h(React.Fragment, null, [
+      h(PaginationControls, {
+        key: "pagination-top",
+        pagination,
+        onPageChange,
+      }),
+      h("table", {key: "table"}, [
+        h("thead", {key: "head"}, h("tr", null, [
+          "时间", "峰值 RMS", "时长", "分类", "分数", "候选标签", "试听",
+        ].map((item) => h("th", {key: item}, item)))),
+        h("tbody", {key: "body"}, events.map((event) => h("tr", {key: `${event.timestamp}-${event.filename}`}, [
+          h("td", {key: "timestamp"}, formatTimestamp(event.timestamp)),
+          h("td", {key: "rms"}, event.peak_rms),
+          h("td", {key: "duration"}, `${event.duration_seconds}s`),
+          h("td", {key: "classification"}, h("span", {className: "tag"}, event.classification)),
+          h("td", {key: "score"}, event.classification_score),
+          h("td", {key: "classes"}, (event.top_classes || []).join(", ")),
+          h("td", {key: "audio"}, h("audio", {controls: true, preload: "none", src: event.record_url})),
+        ]))),
+      ]),
+      h(PaginationControls, {
+        key: "pagination-bottom",
+        pagination,
+        onPageChange,
+      }),
     ]);
   }
 
@@ -499,6 +615,18 @@
   function App() {
     const [status, setStatus] = useState(defaultStatus);
     const [events, setEvents] = useState([]);
+    const [audioDevices, setAudioDevices] = useState([]);
+    const [audioDeviceMeta, setAudioDeviceMeta] = useState({
+      can_switch: false,
+      configured_device_name: "",
+      selected_device_index: null,
+    });
+    const [eventPagination, setEventPagination] = useState({
+      page: 1,
+      page_size: 20,
+      total: 0,
+      total_pages: 1,
+    });
     const [classifications, setClassifications] = useState([]);
     const [filters, setFilters] = useState({classification: "", start_at: "", end_at: ""});
     const [error, setError] = useState("");
@@ -511,10 +639,19 @@
       setStatus(await fetchJson("/api/status"));
     }
 
-    async function loadEvents(nextFilters = filters) {
-      const query = buildQuery(nextFilters);
+    async function loadEvents(nextFilters = filters, nextPage = eventPagination.page || 1) {
+      const query = buildEventQuery(nextFilters, {
+        page: nextPage,
+        pageSize: eventPagination.page_size || 20,
+      });
       const payload = await fetchJson(`/api/events${query ? `?${query}` : ""}`);
       setEvents(payload.events || []);
+      setEventPagination(payload.pagination || {
+        page: nextPage,
+        page_size: eventPagination.page_size || 20,
+        total: 0,
+        total_pages: 1,
+      });
     }
 
     async function loadClassifications() {
@@ -522,10 +659,20 @@
       setClassifications(payload.classifications || []);
     }
 
-    async function refresh(nextFilters = filters) {
+    async function loadAudioDevices() {
+      const payload = await fetchJson("/api/audio-devices");
+      setAudioDevices(payload.devices || []);
+      setAudioDeviceMeta({
+        can_switch: Boolean(payload.can_switch),
+        configured_device_name: payload.configured_device_name || "",
+        selected_device_index: payload.selected_device_index,
+      });
+    }
+
+    async function refresh(nextFilters = filters, nextPage = eventPagination.page || 1) {
       try {
         setError("");
-        await Promise.all([loadStatus(), loadEvents(nextFilters)]);
+        await Promise.all([loadStatus(), loadEvents(nextFilters, nextPage)]);
       } catch (err) {
         setError(err.message);
       }
@@ -533,7 +680,7 @@
 
     useEffect(() => {
       refresh();
-      loadClassifications().catch((err) => setError(err.message));
+      Promise.all([loadClassifications(), loadAudioDevices()]).catch((err) => setError(err.message));
     }, []);
 
     useEffect(() => {
@@ -542,20 +689,24 @@
         return undefined;
       }
       const timer = window.setInterval(() => {
-        refresh();
+        refresh(filters, eventPagination.page || 1);
       }, Number(status.detection_window_seconds) * 1000);
       return () => window.clearInterval(timer);
-    }, [autoRefresh, status.detection_window_seconds, filters]);
+    }, [autoRefresh, status.detection_window_seconds, filters, eventPagination.page]);
 
     function applyFilters(nextFilters) {
       setFilters(nextFilters);
-      loadEvents(nextFilters).then(() => setError("")).catch((err) => setError(err.message));
+      loadEvents(nextFilters, 1).then(() => setError("")).catch((err) => setError(err.message));
     }
 
     function resetFilters() {
       const emptyFilters = {classification: "", start_at: "", end_at: ""};
       setFilters(emptyFilters);
-      loadEvents(emptyFilters).then(() => setError("")).catch((err) => setError(err.message));
+      loadEvents(emptyFilters, 1).then(() => setError("")).catch((err) => setError(err.message));
+    }
+
+    function changeEventPage(nextPage) {
+      loadEvents(filters, nextPage).then(() => setError("")).catch((err) => setError(err.message));
     }
 
     async function calibrateThreshold() {
@@ -568,6 +719,23 @@
       }
     }
 
+    async function switchAudioDevice(deviceIndex) {
+      try {
+        setError("");
+        setStatus((current) => ({...current, is_switching_device: true}));
+        const nextStatus = await fetchJson("/api/audio-device", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({device_index: deviceIndex}),
+        });
+        setStatus(nextStatus);
+        await loadAudioDevices();
+      } catch (err) {
+        setError(err.message);
+        await Promise.all([loadStatus(), loadAudioDevices()]);
+      }
+    }
+
     return h(React.Fragment, null, [
       h("h1", {key: "title"}, "噪音监测面板"),
       h("p", {key: "intro"}, "系统会按固定检测窗口采集音频并运行分类"),
@@ -576,6 +744,14 @@
       activeTab === "status"
         ? h("section", {key: "status-tab", className: "tab-panel"}, [
           h(StatusCards, {key: "status", status}),
+          h(AudioDevicePanel, {
+            key: "device-panel",
+            status,
+            devices: audioDevices,
+            canSwitch: audioDeviceMeta.can_switch,
+            configuredDeviceName: audioDeviceMeta.configured_device_name,
+            onSwitchDevice: switchAudioDevice,
+          }),
           status.last_error ? h("p", {key: "warning"}, `音频后端警告：${status.last_error}`) : null,
           h(WaveformMonitor, {
             key: "monitor",
@@ -594,7 +770,12 @@
             onReset: resetFilters,
           }),
           h("p", {key: "muted", className: "muted"}, "当前事件列表只包含已保留的录音"),
-          h(EventTable, {key: "events", events}),
+          h(EventTable, {
+            key: "events",
+            events,
+            pagination: eventPagination,
+            onPageChange: changeEventPage,
+          }),
         ]),
     ]);
   }

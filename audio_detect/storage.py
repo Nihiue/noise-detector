@@ -35,6 +35,12 @@ class InvalidTimeFilterError(ValueError):
         self.value = value
 
 
+@dataclass(frozen=True)
+class EventQuery:
+    where_sql: str
+    params: Tuple[object, ...]
+
+
 class EventStore:
     def __init__(
         self,
@@ -102,43 +108,11 @@ class EventStore:
         start_at: Optional[str] = None,
         end_at: Optional[str] = None,
     ) -> List[NoiseEvent]:
-        clauses = []
-        params: List[object] = []
-
-        if classification:
-            clauses.append("classification = ?")
-            params.append(classification.strip())
-
-        start_unix = _parse_date_filter(
-            start_at,
-            field_name="start_at",
-            range_edge="start",
-            strict=True,
+        query = self._build_event_query(
+            classification=classification,
+            start_at=start_at,
+            end_at=end_at,
         )
-        if start_unix is not None:
-            clauses.append("timestamp_unix >= ?")
-            params.append(start_unix)
-
-        end_unix = _parse_date_filter(
-            end_at,
-            field_name="end_at",
-            range_edge="end",
-            strict=True,
-        )
-        if end_unix is not None:
-            clauses.append("timestamp_unix <= ?")
-            params.append(end_unix)
-
-        if (
-            start_unix is not None
-            and end_unix is not None
-            and start_unix > end_unix
-        ):
-            raise InvalidTimeFilterError(
-                "time_range",
-                "{start} > {end}".format(start=start_at, end=end_at),
-            )
-
         sql = """
             SELECT
                 timestamp,
@@ -150,13 +124,47 @@ class EventStore:
                 top_classes_json
             FROM noise_events
         """
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
+        sql += query.where_sql
         sql += " ORDER BY timestamp_unix DESC, id DESC"
 
         with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
+            rows = self._conn.execute(sql, query.params).fetchall()
         return [self._row_to_event(row) for row in rows]
+
+    def query_events_page(
+        self,
+        *,
+        classification: Optional[str] = None,
+        start_at: Optional[str] = None,
+        end_at: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> tuple[List[NoiseEvent], int]:
+        query = self._build_event_query(
+            classification=classification,
+            start_at=start_at,
+            end_at=end_at,
+        )
+        sql = """
+            SELECT
+                timestamp,
+                filename,
+                peak_rms,
+                duration_seconds,
+                classification,
+                classification_score,
+                top_classes_json
+            FROM noise_events
+        """
+        sql += query.where_sql
+        sql += " ORDER BY timestamp_unix DESC, id DESC LIMIT ? OFFSET ?"
+        params = query.params + (page_size, (page - 1) * page_size)
+
+        count_sql = "SELECT COUNT(*) FROM noise_events" + query.where_sql
+        with self._lock:
+            total = int(self._conn.execute(count_sql, query.params).fetchone()[0])
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_event(row) for row in rows], total
 
     def distinct_classifications(self) -> List[str]:
         with self._lock:
@@ -278,6 +286,55 @@ class EventStore:
         conn = sqlite3.connect(str(self.database_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
+
+    @staticmethod
+    def _build_event_query(
+        *,
+        classification: Optional[str],
+        start_at: Optional[str],
+        end_at: Optional[str],
+    ) -> EventQuery:
+        clauses = []
+        params: List[object] = []
+
+        if classification:
+            clauses.append("classification = ?")
+            params.append(classification.strip())
+
+        start_unix = _parse_date_filter(
+            start_at,
+            field_name="start_at",
+            range_edge="start",
+            strict=True,
+        )
+        if start_unix is not None:
+            clauses.append("timestamp_unix >= ?")
+            params.append(start_unix)
+
+        end_unix = _parse_date_filter(
+            end_at,
+            field_name="end_at",
+            range_edge="end",
+            strict=True,
+        )
+        if end_unix is not None:
+            clauses.append("timestamp_unix <= ?")
+            params.append(end_unix)
+
+        if (
+            start_unix is not None
+            and end_unix is not None
+            and start_unix > end_unix
+        ):
+            raise InvalidTimeFilterError(
+                "time_range",
+                "{start} > {end}".format(start=start_at, end=end_at),
+            )
+
+        where_sql = ""
+        if clauses:
+            where_sql = " WHERE " + " AND ".join(clauses)
+        return EventQuery(where_sql=where_sql, params=tuple(params))
 
     def _transaction(self):
         return _LockedConnection(self._conn, self._lock)

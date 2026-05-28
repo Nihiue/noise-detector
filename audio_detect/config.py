@@ -26,6 +26,7 @@ class DetectionConfig:
     window_seconds: float
     capture_seconds: float
     threshold_stddev_multiplier: float
+    threshold_rms_offset: float
 
 
 @dataclass
@@ -121,6 +122,7 @@ def _resolve_detection_config(payload: dict[str, Any]) -> DetectionConfig:
         window_seconds=payload["window_seconds"],
         capture_seconds=payload["capture_seconds"],
         threshold_stddev_multiplier=payload.get("threshold_stddev_multiplier", 1.0),
+        threshold_rms_offset=payload.get("threshold_rms_offset", 100.0),
     )
 
 

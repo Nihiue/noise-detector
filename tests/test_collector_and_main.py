@@ -28,7 +28,6 @@ class StubClassifier:
         self.top_classes = top_classes or [f"{self.label}:1.000"]
         self.results = list(results or [])
         self.calls = 0
-        self.last_samples: np.ndarray | None = None
 
     def classify(self, recording_path: Path) -> ClassificationResult:
         return self.classify_samples(np.array([], dtype=np.float32), 16000)
@@ -39,7 +38,6 @@ class StubClassifier:
         sample_rate: int,
     ) -> ClassificationResult:
         self.calls += 1
-        self.last_samples = samples.copy()
         if self.results:
             return self.results.pop(0)
         return ClassificationResult(
@@ -74,20 +72,22 @@ class StubClassifier:
 
 
 class StubAudioInput:
-    def __init__(self) -> None:
+    def __init__(self, index: int = 0, name: str = "Test input") -> None:
         self.selected_device = AudioDeviceInfo(
-            index=0,
-            name="Test input",
+            index=index,
+            name=name,
             max_input_channels=1,
             default_samplerate=16000.0,
         )
         self.last_error = ""
         self._chunk = np.zeros(1024, dtype=np.int16)
+        self.closed = False
 
     def read_chunk(self) -> np.ndarray:
         return self._chunk.copy()
 
     def close(self) -> None:
+        self.closed = True
         return None
 
 
@@ -110,6 +110,7 @@ class CollectorAndMainTests(unittest.TestCase):
                 window_seconds=0.1,
                 capture_seconds=0.1,
                 threshold_stddev_multiplier=1.0,
+                threshold_rms_offset=100.0,
             ),
             event_store=EventStore(
                 records_dir=base / "records",
@@ -209,6 +210,7 @@ class CollectorAndMainTests(unittest.TestCase):
                     window_seconds=0.1,
                     capture_seconds=0.1,
                     threshold_stddev_multiplier=1.0,
+                    threshold_rms_offset=100.0,
                 ),
                 event_store=EventStore(
                     records_dir=base / "records",
@@ -328,60 +330,6 @@ class CollectorAndMainTests(unittest.TestCase):
             self.assertEqual(events[0].top_classes, ["Engine:0.900", "Noise:0.200"])
             self.assertEqual(classifier.calls, 1)
 
-    def test_classification_input_is_normalized_without_changing_recording(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            classifier = StubClassifier()
-            service = self._make_service(Path(tmpdir), classifier=classifier)
-            service._noise_gate.calibrate(np.full(1024, 20, dtype=np.int16))
-            detect_chunk = np.full(1024, 100, dtype=np.int16)
-            capture_chunk = np.full(1024, 150, dtype=np.int16)
-            remaining = [detect_chunk, capture_chunk, capture_chunk]
-
-            def read_chunk() -> np.ndarray:
-                if remaining:
-                    return remaining.pop(0)
-                return capture_chunk
-
-            service.audio_input.read_chunk = read_chunk  # type: ignore[method-assign]
-            original_append = service.event_store.append
-
-            def append_and_stop(event) -> None:
-                original_append(event)
-                service._stop_event.set()
-
-            service.event_store.append = append_and_stop  # type: ignore[method-assign]
-            service._run_loop()
-
-            self.assertIsNotNone(classifier.last_samples)
-            self.assertAlmostEqual(
-                float(np.sqrt(np.mean(classifier.last_samples * classifier.last_samples))),
-                service._CLASSIFICATION_TARGET_RMS,
-                places=5,
-            )
-            recordings = list(service.event_store.records_dir.glob("*.wav"))
-            self.assertEqual(len(recordings), 1)
-            with recordings[0].open("rb") as handle:
-                payload = handle.read()
-            self.assertIn(detect_chunk.tobytes(), payload)
-
-    def test_classification_normalization_limits_peak_level(self) -> None:
-        samples = np.asarray([32767] + [0] * 1023, dtype=np.int16)
-
-        normalized = CollectorService._normalize_for_classification(samples)
-
-        self.assertLessEqual(float(np.max(np.abs(normalized))), 0.95)
-        self.assertLess(
-            float(np.sqrt(np.mean(normalized * normalized))),
-            CollectorService._CLASSIFICATION_TARGET_RMS,
-        )
-
-    def test_classification_normalization_does_not_reduce_loud_input(self) -> None:
-        samples = np.full(1024, 10000, dtype=np.int16)
-
-        normalized = CollectorService._normalize_for_classification(samples)
-
-        np.testing.assert_allclose(normalized, samples.astype(np.float32) / 32768.0)
-
     def test_top3_match_is_retained_even_when_top1_is_not_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             service = self._make_service(
@@ -455,10 +403,11 @@ class CollectorAndMainTests(unittest.TestCase):
 
         self.assertAlmostEqual(calibration.noise_floor_rms, 150.0)
         self.assertAlmostEqual(calibration.noise_floor_std_rms, 50.0)
-        self.assertAlmostEqual(calibration.trigger_threshold_rms, 200.0)
+        self.assertAlmostEqual(calibration.trigger_threshold_rms, 300.0)
         self.assertFalse(below_threshold.should_classify)
         self.assertFalse(above_threshold.should_classify)
-        self.assertTrue(gate.evaluate(220.0).should_classify)
+        self.assertFalse(gate.evaluate(220.0).should_classify)
+        self.assertTrue(gate.evaluate(320.0).should_classify)
 
     def test_noise_gate_uses_configured_stddev_multiplier(self) -> None:
         gate = _NoiseFloorGate(
@@ -476,9 +425,29 @@ class CollectorAndMainTests(unittest.TestCase):
 
         self.assertAlmostEqual(calibration.noise_floor_rms, 150.0)
         self.assertAlmostEqual(calibration.noise_floor_std_rms, 50.0)
-        self.assertAlmostEqual(calibration.trigger_threshold_rms, 250.0)
+        self.assertAlmostEqual(calibration.trigger_threshold_rms, 350.0)
         self.assertFalse(gate.evaluate(220.0).should_classify)
-        self.assertTrue(gate.evaluate(260.0).should_classify)
+        self.assertFalse(gate.evaluate(260.0).should_classify)
+        self.assertTrue(gate.evaluate(360.0).should_classify)
+
+    def test_noise_gate_uses_configured_fixed_rms_offset(self) -> None:
+        gate = _NoiseFloorGate(
+            detection_window_seconds=0.1,
+            threshold_stddev_multiplier=1.0,
+            threshold_rms_offset=40.0,
+        )
+        samples = np.concatenate(
+            [
+                np.full(500, 100, dtype=np.int16),
+                np.full(500, 200, dtype=np.int16),
+            ]
+        )
+
+        calibration = gate.calibrate(samples)
+
+        self.assertAlmostEqual(calibration.trigger_threshold_rms, 240.0)
+        self.assertFalse(gate.evaluate(240.0).should_classify)
+        self.assertTrue(gate.evaluate(250.0).should_classify)
 
     def test_noise_gate_keeps_floor_until_next_calibration(self) -> None:
         gate = _NoiseFloorGate(detection_window_seconds=0.1)
@@ -533,6 +502,37 @@ class CollectorAndMainTests(unittest.TestCase):
 
             self.assertEqual(close_calls, ["closed"])
 
+    def test_switch_input_device_replaces_audio_input_and_resets_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = self._make_service(Path(tmpdir), audio_input=StubAudioInput(index=1, name="Mic A"))
+            replacement = StubAudioInput(index=2, name="Mic B")
+            service._audio_input_factory = lambda: replacement
+            service._selected_device_override_index = 2
+            service._recent_detection_windows.append({"timestamp": "x", "outcome": "recorded"})
+            service._noise_gate.calibrate(np.full(1024, 120, dtype=np.int16))
+            status = service.switch_input_device(2)
+
+            self.assertEqual(status.selected_device_index, 2)
+            self.assertEqual(status.selected_device_name, "Mic B")
+            self.assertFalse(status.gate_ready)
+            self.assertEqual(status.recent_detection_windows, [])
+            self.assertFalse(status.is_switching_device)
+
+    def test_switch_input_device_rolls_back_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original = StubAudioInput(index=1, name="Mic A")
+            service = self._make_service(Path(tmpdir), audio_input=original)
+            service._audio_input_factory = lambda: (_ for _ in ()).throw(RuntimeError("missing device"))
+
+            with self.assertRaises(RuntimeError):
+                service.switch_input_device(5)
+
+            status = service.get_status()
+            self.assertEqual(status.selected_device_index, 1)
+            self.assertEqual(status.selected_device_name, "Mic A")
+            self.assertFalse(status.is_switching_device)
+            self.assertIn("failed to switch input device", status.last_error)
+
     def test_main_fails_fast_when_classifier_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
@@ -569,6 +569,7 @@ class CollectorAndMainTests(unittest.TestCase):
                         window_seconds=0.1,
                         capture_seconds=0.1,
                         threshold_stddev_multiplier=1.0,
+                        threshold_rms_offset=100.0,
                     ),
                     "app": type("AppStub", (), {"host": "127.0.0.1", "port": 8000})(),
                 },
